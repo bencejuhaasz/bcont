@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * wayland-security-context-helper.c
  *
