@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# bcont — bubblewrap-based Wayland/CLI sandbox for Sway compositor.
+# Supports wp_security_context_manager_v1 (Sway >= 1.9).
+#
+# USAGE:
+#   bcont [OPTIONS] -- <command> [args...]
+
+set -euo pipefail
+
+# ── Constants ────────────────────────────────────────────────────────────────
+readonly PROG="${0##*/}"
+readonly VERSION="1.1.0"
+readonly SANDBOX_XRD_INSIDE="/run/user/$(id -u)"
+
+# ── Colors (only on interactive terminal) ────────────────────────────────────
+if [[ -t 2 ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+    C_RED=$'\033[31m';  C_YEL=$'\033[33m'; C_CYA=$'\033[36m'; C_GRN=$'\033[32m'
+else
+    C_RESET=''; C_BOLD=''; C_RED=''; C_YEL=''; C_CYA=''; C_GRN=''
+fi
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_info()  { printf '%s[bcont]%s %s\n'      "$C_CYA$C_BOLD" "$C_RESET" "$*" >&2; }
+log_ok()    { printf '%s[bcont]%s %s\n'      "$C_GRN$C_BOLD" "$C_RESET" "$*" >&2; }
+log_warn()  { printf '%s[bcont WARN]%s %s\n' "$C_YEL$C_BOLD" "$C_RESET" "$*" >&2; }
+log_err()   { printf '%s[bcont ERR]%s %s\n'  "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; }
+log_debug() { [[ $VERBOSE -eq 1 ]] && printf '%s[bcont DBG]%s %s\n' "$C_BOLD" "$C_RESET" "$*" >&2 || true; }
+
+die() { log_err "$*"; exit 1; }
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+usage() {
+    printf '%s%s%s %s — bwrap + wayland-security-context sandbox\n\n' \
+        "$C_BOLD" "$PROG" "$C_RESET" "$VERSION"
+
+    printf '%sUSAGE%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s [OPTIONS] -- <command> [args...]\n\n' "$PROG"
+
+    printf '%sOPTIONS%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s-n, --name NAME%s    Sandbox name / app-id prefix  [default: command basename]\n' "$C_BOLD" "$C_RESET"
+    printf '  %s-N, --net%s          Enable network access          [default: unshare-net]\n'     "$C_BOLD" "$C_RESET"
+    printf '  %s-d, --dbus%s         D-Bus session proxy (filtered to portals only)\n'            "$C_BOLD" "$C_RESET"
+    printf '  %s-p, --pipewire%s     Bind PipeWire socket\n'                                      "$C_BOLD" "$C_RESET"
+    printf '  %s-g, --gpu%s          GPU: full /dev/dri (renderD* + card*)\n'                     "$C_BOLD" "$C_RESET"
+    printf '      %s--gpu-render%s   GPU: renderD* only (no KMS/DRM access)\n'                    "$C_BOLD" "$C_RESET"
+    printf '  %s-H, --home DIR%s     Persistent home directory\n'                                 "$C_BOLD" "$C_RESET"
+    printf '      %s--ro PATH%s      Extra read-only bind (repeatable)\n'                         "$C_BOLD" "$C_RESET"
+    printf '      %s--rw PATH%s      Extra read-write bind (repeatable)\n'                        "$C_BOLD" "$C_RESET"
+    printf '      %s--cli%s          Force CLI mode (no Wayland socket, even if WAYLAND_DISPLAY is set)\n' "$C_BOLD" "$C_RESET"
+    printf '      %s--dry-run%s      Print the bwrap command without executing\n'                 "$C_BOLD" "$C_RESET"
+    printf '  %s-v, --verbose%s      Verbose diagnostics\n'                                       "$C_BOLD" "$C_RESET"
+    printf '  %s-h, --help%s         Show this help\n\n'                                          "$C_BOLD" "$C_RESET"
+
+    printf '%sEXAMPLES%s\n' "$C_BOLD" "$C_RESET"
+    printf '  # Firefox: network, D-Bus, PipeWire, GPU, persistent home\n'
+    printf '  %s -n firefox -N -d -p -g -H ~/sandboxes/firefox -- firefox\n\n' "$PROG"
+    printf '  # mpv: GPU + one read-only video directory\n'
+    printf '  %s -n mpv -g --ro ~/Videos -- mpv ~/Videos/film.mkv\n\n' "$PROG"
+    printf '  # CLI app: full isolation, no Wayland\n'
+    printf '  %s --cli -n mytool -- ./mytool --headless\n\n' "$PROG"
+    printf '  # Auto CLI mode: empty WAYLAND_DISPLAY -> no Wayland socket\n'
+    printf '  WAYLAND_DISPLAY= %s -n build -- make -j$(nproc)\n\n' "$PROG"
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+APP_NAME=""
+ENABLE_NET=0
+ENABLE_DBUS=0
+ENABLE_PIPEWIRE=0
+ENABLE_GPU=0        # 0=none, 1=full, 2=render-only
+FORCE_CLI=0
+DRY_RUN=0
+VERBOSE=0
+HOME_DIR=""
+EXTRA_RO=()
+EXTRA_RW=()
+CMD=()
+
+_short=n:NdpgH:vh
+_long=name:,net,dbus,pipewire,gpu,gpu-render,home:,ro:,rw:,cli,dry-run,verbose,help
+
+if ! PARSED=$(getopt -o "$_short" -l "$_long" -n "$PROG" -- "$@"); then
+    printf 'Run: %s --help\n' "$PROG" >&2; exit 2
+fi
+eval set -- "$PARSED"
+
+while true; do
+    case "$1" in
+        -n|--name)       APP_NAME="$2";                         shift 2 ;;
+        -N|--net)        ENABLE_NET=1;                          shift   ;;
+        -d|--dbus)       ENABLE_DBUS=1;                         shift   ;;
+        -p|--pipewire)   ENABLE_PIPEWIRE=1;                     shift   ;;
+        -g|--gpu)        ENABLE_GPU=1;                          shift   ;;
+           --gpu-render) ENABLE_GPU=2;                          shift   ;;
+        -H|--home)       HOME_DIR="$2";                         shift 2 ;;
+           --ro)         EXTRA_RO+=("$2");                      shift 2 ;;
+           --rw)         EXTRA_RW+=("$2");                      shift 2 ;;
+           --cli)        FORCE_CLI=1;                           shift   ;;
+           --dry-run)    DRY_RUN=1;                             shift   ;;
+        -v|--verbose)    VERBOSE=1;                             shift   ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; CMD=("$@"); break ;;
+        *)               die "Unknown option: $1 — run: ${PROG} --help" ;;
+    esac
+done
+
+[[ ${#CMD[@]} -eq 0 ]] && { usage; die "No command specified."; }
+
+# ── APP_NAME validation ───────────────────────────────────────────────────────
+[[ -z "$APP_NAME" ]] && APP_NAME="$(basename "${CMD[0]}")"
+
+if [[ ! "$APP_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    die "Invalid --name value: '$APP_NAME' (only [a-zA-Z0-9_-] allowed)"
+fi
+
+APP_ID="org.sandbox.${APP_NAME}"
+INSTANCE_ID="${APP_ID}.$$"
+
+# ── Wayland mode detection ────────────────────────────────────────────────────
+# CLI mode when:
+#   1. --cli flag is set, OR
+#   2. WAYLAND_DISPLAY is empty or unset
+WAYLAND_MODE=1
+if [[ $FORCE_CLI -eq 1 ]]; then
+    WAYLAND_MODE=0
+    log_info "CLI mode: --cli flag set, no Wayland socket."
+elif [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+    WAYLAND_MODE=0
+    log_info "CLI mode: WAYLAND_DISPLAY is empty/unset, no Wayland socket."
+fi
+
+if [[ $WAYLAND_MODE -eq 0 ]]; then
+    [[ $ENABLE_DBUS     -eq 1 ]] && log_warn "--dbus is active in CLI mode (D-Bus portal proxy still works)."
+    [[ $ENABLE_PIPEWIRE -eq 1 ]] && log_warn "--pipewire in CLI mode: useful for audio-only access."
+fi
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+_check_dep() {
+    local bin="$1" optional="${2:-0}"
+    if ! command -v "$bin" &>/dev/null; then
+        [[ $optional -eq 1 ]] && { log_warn "Optional dependency missing: $bin"; return 1; }
+        die "Missing dependency: $bin — please install it and retry."
+    fi
+    return 0
+}
+
+_check_dep bwrap
+_check_dep jq
+[[ $WAYLAND_MODE -eq 1 ]] && _check_dep swaymsg
+[[ $ENABLE_DBUS  -eq 1 ]] && _check_dep xdg-dbus-proxy
+
+HAS_SECCTX_HELPER=0
+if [[ $WAYLAND_MODE -eq 1 ]]; then
+    _check_dep wayland-security-context-helper 1 && HAS_SECCTX_HELPER=1
+fi
+
+# ── Sway security-context version check ──────────────────────────────────────
+HAS_SWAY_SECCTX=0
+if [[ $WAYLAND_MODE -eq 1 ]]; then
+    if swaymsg -t get_version 2>/dev/null \
+            | jq -e '.major > 1 or (.major == 1 and .minor >= 9)' &>/dev/null; then
+        HAS_SWAY_SECCTX=1
+        log_debug "Sway >= 1.9 detected, wp_security_context_manager_v1 available."
+    else
+        log_warn "Sway < 1.9 or unavailable — running without security-context."
+    fi
+fi
+
+# ── Runtime directory and cleanup ─────────────────────────────────────────────
+REAL_XRD="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SANDBOX_XRD_HOST="$(mktemp -d -p "$REAL_XRD" "bcont-${APP_NAME}.XXXXXX")"
+chmod 700 "$SANDBOX_XRD_HOST"
+log_debug "Sandbox runtime dir (host): $SANDBOX_XRD_HOST"
+
+DBUS_PROXY_PID=""
+SECCTX_PID=""
+SECCTX_SOCKET=""
+
+cleanup() {
+    log_debug "Cleanup..."
+
+    if [[ -n "$DBUS_PROXY_PID" ]] && kill -0 "$DBUS_PROXY_PID" 2>/dev/null; then
+        kill "$DBUS_PROXY_PID" 2>/dev/null || true
+        wait "$DBUS_PROXY_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$SECCTX_PID" ]] && kill -0 "$SECCTX_PID" 2>/dev/null; then
+        kill "$SECCTX_PID" 2>/dev/null || true
+        wait "$SECCTX_PID" 2>/dev/null || true
+    fi
+
+    [[ -n "$SECCTX_SOCKET" ]] && rm -f "$SECCTX_SOCKET" 2>/dev/null || true
+    rm -rf "$SANDBOX_XRD_HOST" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# ── Wayland socket setup ──────────────────────────────────────────────────────
+WAYLAND_SOCKET_ARGS=()
+WAYLAND_ENV_ARGS=()
+
+if [[ $WAYLAND_MODE -eq 1 ]]; then
+    if [[ $HAS_SWAY_SECCTX -eq 1 && $HAS_SECCTX_HELPER -eq 1 ]]; then
+        SECCTX_SOCKET="$SANDBOX_XRD_HOST/wayland-1"
+
+        wayland-security-context-helper \
+            --app-id         "$APP_ID" \
+            --instance-id    "$INSTANCE_ID" \
+            --sandbox-engine "org.sandbox.bwrap" \
+            --listen-socket  "$SECCTX_SOCKET" &
+        SECCTX_PID=$!
+
+        # Wait for socket, verifying the helper is still alive each iteration
+        _tries=0
+        while [[ $_tries -lt 40 ]]; do
+            [[ -S "$SECCTX_SOCKET" ]] && break
+            if ! kill -0 "$SECCTX_PID" 2>/dev/null; then
+                die "wayland-security-context-helper exited immediately (socket: $SECCTX_SOCKET)"
+            fi
+            sleep 0.05
+            (( _tries++ )) || true
+        done
+        [[ -S "$SECCTX_SOCKET" ]] \
+            || die "Timeout: security-context socket not created: $SECCTX_SOCKET"
+
+        log_ok "Security-context socket ready: $SECCTX_SOCKET (PID: $SECCTX_PID)"
+
+        WAYLAND_SOCKET_ARGS=(
+            --bind "$SECCTX_SOCKET" "$SANDBOX_XRD_INSIDE/wayland-1"
+        )
+    else
+        # Fallback: pass native socket through without filtering
+        _NATIVE_WL="$REAL_XRD/${WAYLAND_DISPLAY:-wayland-1}"
+        [[ -S "$_NATIVE_WL" ]] || die "Wayland socket not found: $_NATIVE_WL"
+
+        if [[ $HAS_SWAY_SECCTX -eq 1 ]]; then
+            log_warn "wayland-security-context-helper not installed — native socket passed through unfiltered!"
+        else
+            log_warn "Sway < 1.9 — privileged Wayland protocols will be accessible!"
+        fi
+
+        WAYLAND_SOCKET_ARGS=(
+            --ro-bind "$_NATIVE_WL" "$SANDBOX_XRD_INSIDE/wayland-1"
+        )
+    fi
+
+    WAYLAND_ENV_ARGS=(
+        --setenv XDG_SESSION_TYPE            "wayland"
+        --setenv WAYLAND_DISPLAY             "wayland-1"
+        --setenv XDG_CURRENT_DESKTOP         "sway"
+        --setenv QT_QPA_PLATFORM             "wayland"
+        --setenv GDK_BACKEND                 "wayland"
+        --setenv MOZ_ENABLE_WAYLAND          "1"
+        --setenv SDL_VIDEODRIVER             "wayland"
+        --setenv CLUTTER_BACKEND             "wayland"
+        --setenv _JAVA_AWT_WM_NONREPARENTING "1"
+        --unsetenv DISPLAY
+        --unsetenv XAUTHORITY
+    )
+else
+    # CLI mode: no Wayland socket, all display envs cleared
+    WAYLAND_ENV_ARGS=(
+        --unsetenv WAYLAND_DISPLAY
+        --unsetenv DISPLAY
+        --unsetenv XAUTHORITY
+        --unsetenv XDG_SESSION_TYPE
+        --unsetenv QT_QPA_PLATFORM
+        --unsetenv GDK_BACKEND
+        --unsetenv MOZ_ENABLE_WAYLAND
+        --unsetenv SDL_VIDEODRIVER
+        --unsetenv CLUTTER_BACKEND
+    )
+    log_debug "CLI mode: Wayland envs cleared, no socket bound."
+fi
+
+# ── D-Bus proxy ───────────────────────────────────────────────────────────────
+DBUS_ARGS=()
+if [[ $ENABLE_DBUS -eq 1 ]]; then
+    PROXY_SOCKET_HOST="$SANDBOX_XRD_HOST/bus"
+    PROXY_SOCKET_INSIDE="$SANDBOX_XRD_INSIDE/bus"
+
+    xdg-dbus-proxy \
+        "$DBUS_SESSION_BUS_ADDRESS" \
+        "$PROXY_SOCKET_HOST" \
+        --filter \
+        --talk=org.freedesktop.portal.Desktop \
+        --talk=org.freedesktop.portal.Documents \
+        --talk=org.freedesktop.portal.Flatpak \
+        --talk=org.freedesktop.portal.ScreenCast \
+        --talk=org.freedesktop.portal.RemoteDesktop \
+        --talk=org.freedesktop.Notifications \
+        --talk=org.a11y.Bus \
+        --call="org.freedesktop.portal.*=*" \
+        --broadcast="org.freedesktop.portal.*=@/org/freedesktop/portal/*" \
+        &
+    DBUS_PROXY_PID=$!
+
+    _tries=0
+    while [[ $_tries -lt 40 ]]; do
+        [[ -S "$PROXY_SOCKET_HOST" ]] && break
+        if ! kill -0 "$DBUS_PROXY_PID" 2>/dev/null; then
+            die "xdg-dbus-proxy exited immediately"
+        fi
+        sleep 0.05
+        (( _tries++ )) || true
+    done
+    [[ -S "$PROXY_SOCKET_HOST" ]] \
+        || die "D-Bus proxy socket not created: $PROXY_SOCKET_HOST"
+
+    log_ok "D-Bus proxy ready (PID: $DBUS_PROXY_PID)"
+
+    DBUS_ARGS=(
+        --bind   "$PROXY_SOCKET_HOST"     "$PROXY_SOCKET_INSIDE"
+        --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$PROXY_SOCKET_INSIDE"
+    )
+fi
+
+# ── PipeWire ──────────────────────────────────────────────────────────────────
+PIPEWIRE_ARGS=()
+if [[ $ENABLE_PIPEWIRE -eq 1 ]]; then
+    PW_SOCK="$REAL_XRD/pipewire-0"
+    if [[ -S "$PW_SOCK" ]]; then
+        PIPEWIRE_ARGS=( --ro-bind "$PW_SOCK" "$SANDBOX_XRD_INSIDE/pipewire-0" )
+        log_debug "PipeWire socket: $PW_SOCK"
+    else
+        log_warn "PipeWire socket not found: $PW_SOCK — --pipewire has no effect."
+    fi
+fi
+
+# ── GPU / DRI ─────────────────────────────────────────────────────────────────
+GPU_ARGS=()
+if [[ $ENABLE_GPU -eq 1 ]]; then
+    GPU_ARGS+=( --dev-bind /dev/dri /dev/dri )
+    [[ -d /sys/dev/char ]] && GPU_ARGS+=( --ro-bind /sys/dev/char /sys/dev/char )
+    [[ -d /sys/devices  ]] && GPU_ARGS+=( --ro-bind /sys/devices  /sys/devices  )
+    log_debug "GPU: full /dev/dri (card* + renderD*)"
+elif [[ $ENABLE_GPU -eq 2 ]]; then
+    for _node in /dev/dri/renderD*; do
+        [[ -c "$_node" ]] && GPU_ARGS+=( --dev-bind "$_node" "$_node" )
+    done
+    if [[ ${#GPU_ARGS[@]} -eq 0 ]]; then
+        log_warn "No /dev/dri/renderD* nodes found — --gpu-render has no effect."
+    else
+        [[ -d /sys/dev/char ]] && GPU_ARGS+=( --ro-bind /sys/dev/char /sys/dev/char )
+        [[ -d /sys/devices  ]] && GPU_ARGS+=( --ro-bind /sys/devices  /sys/devices  )
+        log_debug "GPU: render-only nodes bound."
+    fi
+fi
+
+# ── Network ───────────────────────────────────────────────────────────────────
+NET_ARGS=( --unshare-net )
+if [[ $ENABLE_NET -eq 1 ]]; then
+    NET_ARGS=()
+    [[ -f /etc/resolv.conf   ]] && NET_ARGS+=( --ro-bind /etc/resolv.conf   /etc/resolv.conf   )
+    [[ -f /etc/hosts         ]] && NET_ARGS+=( --ro-bind /etc/hosts         /etc/hosts         )
+    [[ -f /etc/nsswitch.conf ]] && NET_ARGS+=( --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf )
+    log_debug "Network enabled."
+fi
+
+# ── Home directory ────────────────────────────────────────────────────────────
+HOME_ARGS=()
+SANDBOX_HOME="/home/sandbox"
+
+if [[ -n "$HOME_DIR" ]]; then
+    HOME_DIR="$(realpath -m "$HOME_DIR")"
+    [[ "$HOME_DIR" == "/"     ]] && die "--home cannot be the root directory"
+    [[ "$HOME_DIR" == "/root" ]] && die "--home cannot be /root"
+    mkdir -p "$HOME_DIR"
+    HOME_ARGS=( --bind "$HOME_DIR" "$SANDBOX_HOME" )
+    log_debug "Persistent home: $HOME_DIR -> $SANDBOX_HOME"
+else
+    HOME_ARGS=( --tmpfs "$SANDBOX_HOME" )
+    log_debug "Ephemeral tmpfs home."
+fi
+
+# ── Extra binds ───────────────────────────────────────────────────────────────
+EXTRA_ARGS=()
+for _p in "${EXTRA_RO[@]+"${EXTRA_RO[@]}"}"; do
+    [[ -z "$_p" ]] && continue
+    _p="$(realpath -m "$_p")"
+    case "$_p" in
+        /proc/*|/sys/kernel/*|/root)
+            log_warn "Suspicious --ro path skipped: $_p" ;;
+        *)
+            if [[ -e "$_p" ]]; then
+                EXTRA_ARGS+=( --ro-bind "$_p" "$_p" )
+                log_debug "Extra ro-bind: $_p"
+            else
+                log_warn "--ro path does not exist, skipped: $_p"
+            fi ;;
+    esac
+done
+
+for _p in "${EXTRA_RW[@]+"${EXTRA_RW[@]}"}"; do
+    [[ -z "$_p" ]] && continue
+    _p="$(realpath -m "$_p")"
+    case "$_p" in
+        /proc/*|/sys/*|/etc|/usr|/root)
+            log_warn "Dangerous --rw path denied: $_p" ;;
+        *)
+            if [[ -e "$_p" ]]; then
+                EXTRA_ARGS+=( --bind "$_p" "$_p" )
+                log_debug "Extra rw-bind: $_p"
+            else
+                log_warn "--rw path does not exist, skipped: $_p"
+            fi ;;
+    esac
+done
+
+# ── Minimal /etc binds (not the whole /etc) ───────────────────────────────────
+ETC_ARGS=()
+for _f in \
+    /etc/ld.so.cache /etc/ld.so.conf /etc/ld.so.conf.d \
+    /etc/fonts /etc/ssl/certs /etc/ca-certificates \
+    /etc/localtime /etc/locale.gen /etc/locale.conf \
+    /etc/machine-id /etc/os-release \
+    /etc/alternatives /etc/xdg \
+    /etc/gtk-3.0 /etc/gtk-4.0 \
+    /etc/pango /etc/dconf; do
+    [[ -e "$_f" ]] && ETC_ARGS+=( --ro-bind "$_f" "$_f" )
+done
+
+# ── Assemble bwrap arguments ──────────────────────────────────────────────────
+BWRAP_ARGS=(
+    # Namespaces
+    --unshare-user
+    --unshare-ipc
+    --unshare-pid
+    --unshare-uts
+    --unshare-cgroup-try
+    "${NET_ARGS[@]}"
+
+    # Drop all capabilities
+    --cap-drop ALL
+
+    # Base filesystem
+    --tmpfs /
+    --proc  /proc
+    --dev   /dev
+    --mqueue /dev/mqueue
+
+    # System (read-only)
+    --ro-bind /usr /usr
+    --symlink usr/bin /bin
+    --symlink usr/bin /sbin
+    --symlink usr/lib /lib
+    --symlink usr/lib /lib64
+
+    # /etc: only required files (not the whole directory)
+    --tmpfs /etc
+    "${ETC_ARGS[@]}"
+
+    # /var minimal
+    --tmpfs /var
+    --ro-bind-try /var/cache/fontconfig /var/cache/fontconfig
+
+    # /tmp and /run
+    --tmpfs /tmp
+    --tmpfs /run
+    --tmpfs "$SANDBOX_XRD_INSIDE"
+    --chmod 0700 "$SANDBOX_XRD_INSIDE"
+
+    # Wayland socket (empty in CLI mode)
+    "${WAYLAND_SOCKET_ARGS[@]+"${WAYLAND_SOCKET_ARGS[@]}"}"
+
+    # D-Bus proxy
+    "${DBUS_ARGS[@]+"${DBUS_ARGS[@]}"}"
+
+    # PipeWire
+    "${PIPEWIRE_ARGS[@]+"${PIPEWIRE_ARGS[@]}"}"
+
+    # GPU
+    "${GPU_ARGS[@]+"${GPU_ARGS[@]}"}"
+
+    # Home
+    "${HOME_ARGS[@]}"
+
+    # Extra binds
+    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+
+    # Environment — clearenv, then only what is needed
+    --clearenv
+    --setenv HOME            "$SANDBOX_HOME"
+    --setenv USER            "sandbox"
+    --setenv LOGNAME         "sandbox"
+    --setenv HOST            "$APP_NAME"
+    --setenv HOSTNAME        "$APP_NAME"
+    --setenv PATH            "/usr/bin:/usr/local/bin"
+    --setenv SHELL           "/bin/bash"
+    --setenv LANG            "${LANG:-C.UTF-8}"
+    --setenv TERM            "${TERM:-xterm-256color}"
+    --setenv XDG_RUNTIME_DIR "$SANDBOX_XRD_INSIDE"
+    --setenv XDG_DATA_DIRS   "/usr/share:/usr/local/share"
+    --setenv XDG_CONFIG_DIRS "/etc/xdg"
+
+    # Wayland / CLI display envs
+    "${WAYLAND_ENV_ARGS[@]}"
+
+    # Security
+    --new-session
+    --die-with-parent
+    --as-pid-1
+
+    # The command
+    "${CMD[@]}"
+)
+
+# ── Dry-run output ────────────────────────────────────────────────────────────
+if [[ $DRY_RUN -eq 1 ]]; then
+    printf '%s--- dry-run: bwrap command ---%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '%q ' bwrap "${BWRAP_ARGS[@]}"
+    printf '\n'
+    exit 0
+fi
+
+if [[ $VERBOSE -eq 1 ]]; then
+    log_debug "Starting: $APP_NAME ($APP_ID)"
+    log_debug "Command:  ${CMD[*]}"
+    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU"
+fi
+
+# ── Execute ───────────────────────────────────────────────────────────────────
+exec bwrap "${BWRAP_ARGS[@]}"
