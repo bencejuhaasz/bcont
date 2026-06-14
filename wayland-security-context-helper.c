@@ -2,13 +2,13 @@
 /*
  * wayland-security-context-helper.c
  *
- * Létrehoz egy új Wayland listening socketet, és a Sway felé
- * wp_security_context_manager_v1-en keresztül megjelöli sandboxoltnak.
- * A program a foreground-ban marad és blokkol — ezt a hívó scriptnek
- * `&`-tal kell háttérbe küldenie, vagy systemd unit / supervisor alatt
- * futtatnia. Amíg él, a security context érvényes; ha kilép (vagy a
- * parent meghal --die-with-parent miatt), a Sway eldobja a contextet és
- * a socketen keresztüli új kapcsolatok elutasításra kerülnek.
+ * Creates a new Wayland listening socket and registers it with Sway via
+ * wp_security_context_manager_v1, marking it as a sandboxed connection.
+ * The process stays in the foreground and blocks — the caller must background
+ * it with `&`, or run it under a systemd unit / supervisor. While it lives,
+ * the security context is valid. When it exits (or when the parent dies due to
+ * --die-with-parent), Sway drops the context and new connections on the socket
+ * are rejected.
  *
  * Build:
  *   wayland-scanner client-header \
@@ -21,14 +21,14 @@
  *      wayland-security-context-helper.c security-context-v1-protocol.c \
  *      -lwayland-client
  *
- * Használat (foreground daemon):
+ * Usage (foreground daemon):
  *   wayland-security-context-helper \
  *     --app-id org.sandbox.firefox \
  *     --instance-id org.sandbox.firefox.12345 \
  *     --sandbox-engine org.sandbox.bwrap \
  *     --listen-socket /run/user/1000/sandbox-xxx/wayland-1 &
  *   HELPER_PID=$!
- *   # ... futtasd a sandbox-olt klienst ...
+ *   # ... run the sandboxed client ...
  *   kill $HELPER_PID
  */
 
@@ -120,13 +120,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* Signal handlerek a tiszta kilépéshez */
+    /* Set up signal handlers for clean exit. */
     struct sigaction sa = { .sa_handler = on_signal };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGHUP,  &sa, NULL);
-    /* Ha a parent meghal és valami pipe-ra írunk, ne haljunk meg SIGPIPE-tól */
+    /* Ignore SIGPIPE in case the parent dies and we write to a pipe. */
     signal(SIGPIPE, SIG_IGN);
 
     struct wl_display *dpy = wl_display_connect(NULL);
@@ -143,9 +143,9 @@ int main(int argc, char **argv) {
 
     if (!ctx.mgr) {
         fprintf(stderr,
-            "wp_security_context_manager_v1 nem elérhető — "
-            "Sway >= 1.9 kell hozzá, és nem létezhet még másik aktív context "
-            "ugyanezen a kapcsolaton.\n");
+            "wp_security_context_manager_v1 not available — "
+            "requires Sway >= 1.9, and no other active context may exist "
+            "on the same connection.\n");
         return 1;
     }
 
@@ -153,14 +153,14 @@ int main(int argc, char **argv) {
     if (listen_fd < 0) return 1;
 
     /*
-     * close_fd: amíg a write-end nyitva van, a context aktív. Amint az
-     * UTOLSÓ írható referencia is bezárul, a Sway EOF-ot kap a read-enden,
-     * eldobja a contextet és a socket-en új kapcsolatok elutasításra
-     * kerülnek (a már létrejöttek megmaradnak).
+     * close_fd lifetime: the security context stays active as long as the
+     * write end of this pipe is open. When the last writable reference closes,
+     * Sway sees EOF on the read end, drops the context, and new connections on
+     * the socket are rejected (existing connections remain unaffected).
      *
-     * A read-endet a compositornak adjuk át (ez wl_proxy-n keresztül FD-passing).
-     * A write-endet mi tartjuk nyitva — amikor mi kilépünk (pl. SIGTERM),
-     * a kernel automatikusan bezárja, és a context megszűnik.
+     * We pass the read end to the compositor via fd-passing over the Wayland
+     * connection. We keep the write end — when we exit (e.g. on SIGTERM), the
+     * kernel closes it automatically and the context is released.
      */
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) < 0) { perror("pipe"); return 1; }
@@ -175,24 +175,24 @@ int main(int argc, char **argv) {
     wp_security_context_v1_commit(sc);
     wp_security_context_v1_destroy(sc);
 
-    /* Várjuk meg hogy a commit valóban átment a compositorhoz */
+    /* Wait for the commit to be processed by the compositor. */
     wl_display_roundtrip(dpy);
 
-    /* A listen_fd-t és a pipe read-endet már a compositor birtokolja */
+    /* The compositor now owns listen_fd and the pipe read end. */
     close(listen_fd);
     close(pipefd[0]);
 
-    /* Diagnosztika a hívónak. A scriptnek elég a socket fájl megjelenésére
-     * várni, ezért itt csak egy info sor a stderr-re. */
-    fprintf(stderr, "security-context aktív: app-id=%s socket=%s\n",
+    /* Signal readiness to the caller. The script waits for the socket file to
+     * appear, so a single info line on stderr is sufficient. */
+    fprintf(stderr, "security-context active: app-id=%s socket=%s\n",
             app_id, sock_path);
     fflush(stderr);
 
     /*
-     * Fő loop: Wayland eseményeket pumpálunk amíg signal nem érkezik.
-     * A wl_display_dispatch blokkol amíg jön esemény. Ha a compositor
-     * lecsatlakozik (pl. Sway leáll), -1-et ad vissza és kilépünk.
-     * A SIGTERM/SIGINT megszakítja a dispatchet (EINTR-rel tér vissza).
+     * Main loop: pump Wayland events until a signal arrives.
+     * wl_display_dispatch blocks until an event is ready. If the compositor
+     * disconnects (e.g. Sway exits) it returns -1 and we exit.
+     * SIGTERM/SIGINT interrupt the dispatch call with EINTR.
      */
     while (!should_exit) {
         if (wl_display_dispatch(dpy) < 0) {
@@ -201,8 +201,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Tiszta takarítás. A pipefd[1] bezárása szól a compositornak hogy
-     * a context vége. A wl_display_disconnect a kapcsolatot zárja. */
+    /* Clean up. Closing pipefd[1] signals the compositor that the context is
+     * gone. wl_display_disconnect closes the Wayland connection. */
     close(pipefd[1]);
     wl_display_disconnect(dpy);
     unlink(sock_path);
