@@ -663,7 +663,13 @@ _bind_nvidia() {
         GPU_ARGS+=( --dev-bind "$_nv" "$_nv" )
         found=1
     done
-    [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*)."
+    # nvidia-caps/ holds character devices used by NVML (nvidia-smi, monitoring).
+    # Skipped by the glob above because it is a directory, not a char device.
+    if [[ -d /dev/nvidia-caps ]]; then
+        GPU_ARGS+=( --dev-bind /dev/nvidia-caps /dev/nvidia-caps )
+        found=1
+    fi
+    [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*, /dev/nvidia-caps)."
 }
 
 GPU_ARGS=()
