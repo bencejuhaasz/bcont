@@ -168,6 +168,7 @@ list_profiles() {
         fi
     done < "$BCONT_CONFIG"
     [[ $count -eq 0 ]] && printf '  (none — add [name] sections to %s)\n' "$BCONT_CONFIG"
+    return 0
 }
 
 show_profile() {
@@ -193,6 +194,7 @@ show_profile() {
         [[ $in_section -eq 1 && -n "$stripped" ]] && printf '  %s\n' "$stripped"
     done < "$BCONT_CONFIG"
     [[ $found -eq 0 ]] && die "Profile '$name' not found in $BCONT_CONFIG"
+    return 0
 }
 
 cmd_init() {
