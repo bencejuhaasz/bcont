@@ -672,12 +672,21 @@ _bind_nvidia() {
     [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*, /dev/nvidia-caps)."
 }
 
+_bind_gpu_sysfs() {
+    [[ -d /sys/dev/char  ]] && GPU_ARGS+=( --ro-bind /sys/dev/char  /sys/dev/char  )
+    [[ -d /sys/devices   ]] && GPU_ARGS+=( --ro-bind /sys/devices   /sys/devices   )
+    # /sys/class/drm and /sys/bus/pci are used by NVML and the Vulkan ICD to
+    # enumerate physical GPUs. Without them vkEnumeratePhysicalDevices returns
+    # zero and nvml reports "GPU access blocked by the operating system".
+    [[ -d /sys/class/drm ]] && GPU_ARGS+=( --ro-bind /sys/class/drm /sys/class/drm )
+    [[ -d /sys/bus/pci   ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci   /sys/bus/pci   )
+}
+
 GPU_ARGS=()
 if [[ $ENABLE_GPU -eq 1 ]]; then
     GPU_ARGS+=( --dev-bind /dev/dri /dev/dri )
     _bind_nvidia
-    [[ -d /sys/dev/char ]] && GPU_ARGS+=( --ro-bind /sys/dev/char /sys/dev/char )
-    [[ -d /sys/devices  ]] && GPU_ARGS+=( --ro-bind /sys/devices  /sys/devices  )
+    _bind_gpu_sysfs
     log_debug "GPU: full /dev/dri (card* + renderD*)"
 elif [[ $ENABLE_GPU -eq 2 ]]; then
     for _node in /dev/dri/renderD*; do
@@ -687,8 +696,7 @@ elif [[ $ENABLE_GPU -eq 2 ]]; then
         log_warn "No /dev/dri/renderD* nodes found — --gpu-render has no effect."
     else
         _bind_nvidia
-        [[ -d /sys/dev/char ]] && GPU_ARGS+=( --ro-bind /sys/dev/char /sys/dev/char )
-        [[ -d /sys/devices  ]] && GPU_ARGS+=( --ro-bind /sys/devices  /sys/devices  )
+        _bind_gpu_sysfs
         log_debug "GPU: render-only nodes bound."
     fi
 fi
@@ -766,21 +774,10 @@ for _f in \
     [[ -e "$_f" ]] && ETC_ARGS+=( --ro-bind "$_f" "$_f" )
 done
 
-# ── Namespace flags ───────────────────────────────────────────────────────────
-# NVIDIA driver 545+ blocks NVML and Vulkan when running inside a non-initial
-# user namespace. bwrap is setuid on Arch so the user namespace is not required
-# for privilege separation — the other namespaces (pid/ipc/net/uts/mount) still
-# provide strong isolation without it.
-USERNS_ARGS=(--unshare-user)
-if [[ $ENABLE_GPU -gt 0 ]]; then
-    USERNS_ARGS=()
-    log_warn "GPU mode: user namespace disabled (NVIDIA driver blocks it). Other namespaces active."
-fi
-
 # ── Assemble bwrap arguments ──────────────────────────────────────────────────
 BWRAP_ARGS=(
     # Namespaces
-    "${USERNS_ARGS[@]+"${USERNS_ARGS[@]}"}"
+    --unshare-user
     --unshare-ipc
     --unshare-pid
     --unshare-uts
