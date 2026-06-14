@@ -766,10 +766,21 @@ for _f in \
     [[ -e "$_f" ]] && ETC_ARGS+=( --ro-bind "$_f" "$_f" )
 done
 
+# ── Namespace flags ───────────────────────────────────────────────────────────
+# NVIDIA driver 545+ blocks NVML and Vulkan when running inside a non-initial
+# user namespace. bwrap is setuid on Arch so the user namespace is not required
+# for privilege separation — the other namespaces (pid/ipc/net/uts/mount) still
+# provide strong isolation without it.
+USERNS_ARGS=(--unshare-user)
+if [[ $ENABLE_GPU -gt 0 ]]; then
+    USERNS_ARGS=()
+    log_warn "GPU mode: user namespace disabled (NVIDIA driver blocks it). Other namespaces active."
+fi
+
 # ── Assemble bwrap arguments ──────────────────────────────────────────────────
 BWRAP_ARGS=(
     # Namespaces
-    --unshare-user
+    "${USERNS_ARGS[@]+"${USERNS_ARGS[@]}"}"
     --unshare-ipc
     --unshare-pid
     --unshare-uts
