@@ -673,13 +673,14 @@ _bind_nvidia() {
 }
 
 _bind_gpu_sysfs() {
-    [[ -d /sys/dev/char  ]] && GPU_ARGS+=( --ro-bind /sys/dev/char  /sys/dev/char  )
-    [[ -d /sys/devices   ]] && GPU_ARGS+=( --ro-bind /sys/devices   /sys/devices   )
-    # /sys/class/drm and /sys/bus/pci are used by NVML and the Vulkan ICD to
-    # enumerate physical GPUs. Without them vkEnumeratePhysicalDevices returns
-    # zero and nvml reports "GPU access blocked by the operating system".
-    [[ -d /sys/class/drm ]] && GPU_ARGS+=( --ro-bind /sys/class/drm /sys/class/drm )
-    [[ -d /sys/bus/pci   ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci   /sys/bus/pci   )
+    [[ -d /sys/dev/char       ]] && GPU_ARGS+=( --ro-bind /sys/dev/char       /sys/dev/char       )
+    [[ -d /sys/devices        ]] && GPU_ARGS+=( --ro-bind /sys/devices        /sys/devices        )
+    [[ -d /sys/class/drm      ]] && GPU_ARGS+=( --ro-bind /sys/class/drm      /sys/class/drm      )
+    [[ -d /sys/bus/pci        ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci        /sys/bus/pci        )
+    # /sys/module/nvidia is required by NVML to enumerate GPUs; without it,
+    # both nvidia-smi and vkEnumeratePhysicalDevices fail with "GPU access
+    # blocked by the operating system".
+    [[ -d /sys/module/nvidia  ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia  /sys/module/nvidia  )
 }
 
 GPU_ARGS=()
