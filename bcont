@@ -4,13 +4,18 @@
 #
 # USAGE:
 #   bcont [OPTIONS] -- <command> [args...]
+#   bcont <profile>  [OPTIONS] [-- extra-args]
+#   bcont list | show <profile> | edit | init | completion bash|zsh
 
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 readonly PROG="${0##*/}"
-readonly VERSION="1.1.0"
+readonly VERSION="1.3.0"
 readonly SANDBOX_XRD_INSIDE="/run/user/$(id -u)"
+readonly BCONT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/bcont/profiles"
+
+VERBOSE=0  # declared early so log_debug works in config functions
 
 # ── Colors (only on interactive terminal) ────────────────────────────────────
 if [[ -t 2 ]]; then
@@ -31,37 +36,333 @@ die() { log_err "$*"; exit 1; }
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 usage() {
-    printf '%s%s%s %s — bwrap + wayland-security-context sandbox\n\n' \
+    printf '%s%s%s %s — bubblewrap sandbox with Wayland security-context for Sway\n\n' \
         "$C_BOLD" "$PROG" "$C_RESET" "$VERSION"
 
-    printf '%sUSAGE%s\n' "$C_BOLD" "$C_RESET"
-    printf '  %s [OPTIONS] -- <command> [args...]\n\n' "$PROG"
+    printf '%sQUICK START%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s init                   create starter config with example profiles\n' "$PROG"
+    printf '  %s list                   list your saved profiles\n' "$PROG"
+    printf '  %s firefox                run the [firefox] profile\n' "$PROG"
+    printf '  %s firefox --shell        enter the firefox sandbox with your shell\n\n' "$PROG"
 
-    printf '%sOPTIONS%s\n' "$C_BOLD" "$C_RESET"
-    printf '  %s-n, --name NAME%s    Sandbox name / app-id prefix  [default: command basename]\n' "$C_BOLD" "$C_RESET"
-    printf '  %s-N, --net%s          Enable network access          [default: unshare-net]\n'     "$C_BOLD" "$C_RESET"
-    printf '  %s-d, --dbus%s         D-Bus session proxy (filtered to portals only)\n'            "$C_BOLD" "$C_RESET"
-    printf '  %s-p, --pipewire%s     Bind PipeWire socket\n'                                      "$C_BOLD" "$C_RESET"
-    printf '  %s-g, --gpu%s          GPU: full /dev/dri (renderD* + card*)\n'                     "$C_BOLD" "$C_RESET"
-    printf '      %s--gpu-render%s   GPU: renderD* only (no KMS/DRM access)\n'                    "$C_BOLD" "$C_RESET"
-    printf '  %s-H, --home DIR%s     Persistent home directory\n'                                 "$C_BOLD" "$C_RESET"
-    printf '      %s--ro PATH%s      Extra read-only bind (repeatable)\n'                         "$C_BOLD" "$C_RESET"
-    printf '      %s--rw PATH%s      Extra read-write bind (repeatable)\n'                        "$C_BOLD" "$C_RESET"
-    printf '      %s--cli%s          Force CLI mode (no Wayland socket, even if WAYLAND_DISPLAY is set)\n' "$C_BOLD" "$C_RESET"
-    printf '      %s--dry-run%s      Print the bwrap command without executing\n'                 "$C_BOLD" "$C_RESET"
-    printf '  %s-v, --verbose%s      Verbose diagnostics\n'                                       "$C_BOLD" "$C_RESET"
-    printf '  %s-h, --help%s         Show this help\n\n'                                          "$C_BOLD" "$C_RESET"
+    printf '%sPROFILE USAGE%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s <profile>              run profile command as defined in config\n' "$PROG"
+    printf '  %s <profile> --shell      drop into a shell inside the sandbox instead\n' "$PROG"
+    printf '  %s <profile> -- extra..   append extra args to the profile'\''s command\n' "$PROG"
+    printf '  %s <profile> %s-N%s           enable network (even if profile has net=false)\n' "$PROG" "$C_BOLD" "$C_RESET"
+    printf '  %s <profile> %s-g%s           enable GPU (even if profile does not set it)\n\n' "$PROG" "$C_BOLD" "$C_RESET"
+
+    printf '%sDIRECT USAGE%s  (no profile)\n' "$C_BOLD" "$C_RESET"
+    printf '  %s [FLAGS] -- <command> [args...]\n\n' "$PROG"
+
+    printf '%sFLAGS%s  (all are on/off toggles unless noted with %sVALUE%s)\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  %s-s, --shell%s        run \$SHELL inside the sandbox instead of the given command\n' "$C_BOLD" "$C_RESET"
+    printf '  %s-N, --net%s          allow network access            [default: network blocked]\n' "$C_BOLD" "$C_RESET"
+    printf '  %s-d, --dbus%s         allow D-Bus via portal filter   [default: no D-Bus]\n'       "$C_BOLD" "$C_RESET"
+    printf '  %s-p, --pipewire%s     allow PipeWire audio socket     [default: no audio]\n'       "$C_BOLD" "$C_RESET"
+    printf '  %s-g, --gpu%s          allow full GPU (/dev/dri)       [default: no GPU]\n'         "$C_BOLD" "$C_RESET"
+    printf '      %s--gpu-render%s   allow render nodes only (no KMS/DRM)\n'                      "$C_BOLD" "$C_RESET"
+    printf '      %s--cli%s          no Wayland socket (for headless / CLI-only apps)\n'          "$C_BOLD" "$C_RESET"
+    printf '  %s-H, --home%s %sDIR%s    persistent home directory       [default: empty tmpfs]\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '      %s--ro%s %sPATH%s     bind a path read-only inside the sandbox (repeatable)\n'  "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '      %s--rw%s %sPATH%s     bind a path read-write inside the sandbox (repeatable)\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  %s-n, --name%s %sNAME%s   sandbox identity / app-id     [default: command basename]\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '      %s--dry-run%s      print the bwrap command without running it\n'                "$C_BOLD" "$C_RESET"
+    printf '  %s-v, --verbose%s      show debug output\n'                                         "$C_BOLD" "$C_RESET"
+    printf '  %s-h, --help%s         show this help\n\n'                                          "$C_BOLD" "$C_RESET"
+
+    printf '%sSUBCOMMANDS%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %slist%s, %sls%s           list all saved profiles\n'           "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  %sshow%s <profile>     print a profile'\''s settings\n'         "$C_BOLD" "$C_RESET"
+    printf '  %sedit%s               open the config file in \$EDITOR\n'      "$C_BOLD" "$C_RESET"
+    printf '  %sinit%s               create a starter config with examples\n' "$C_BOLD" "$C_RESET"
+    printf '  %scompletion%s bash|zsh  print a shell completion script\n\n'   "$C_BOLD" "$C_RESET"
 
     printf '%sEXAMPLES%s\n' "$C_BOLD" "$C_RESET"
-    printf '  # Firefox: network, D-Bus, PipeWire, GPU, persistent home\n'
-    printf '  %s -n firefox -N -d -p -g -H ~/sandboxes/firefox -- firefox\n\n' "$PROG"
-    printf '  # mpv: GPU + one read-only video directory\n'
-    printf '  %s -n mpv -g --ro ~/Videos -- mpv ~/Videos/film.mkv\n\n' "$PROG"
-    printf '  # CLI app: full isolation, no Wayland\n'
-    printf '  %s --cli -n mytool -- ./mytool --headless\n\n' "$PROG"
-    printf '  # Auto CLI mode: empty WAYLAND_DISPLAY -> no Wayland socket\n'
-    printf '  WAYLAND_DISPLAY= %s -n build -- make -j$(nproc)\n\n' "$PROG"
+    printf '  %s mpv                          # run mpv profile (gpu + ~/Videos ro-bind)\n' "$PROG"
+    printf '  %s mpv --shell                  # explore the mpv sandbox in a shell\n' "$PROG"
+    printf '  %s firefox -- --private-window  # run firefox with an extra flag\n' "$PROG"
+    printf '  %s firefox -N                   # temporarily allow network (profile has net=false)\n' "$PROG"
+    printf '  %s --cli --ro ~/src -- make -j  # direct: isolated build, src read-only\n\n' "$PROG"
 }
+
+# ── Config / profile support ─────────────────────────────────────────────────
+
+_profile_exists() {
+    local name="$1"
+    [[ -f "$BCONT_CONFIG" ]] && grep -qE "^\[${name}\][[:space:]]*$" "$BCONT_CONFIG"
+}
+
+# Loads a profile into P_* variables.
+# Sets: P_NAME P_NET P_DBUS P_PIPEWIRE P_GPU P_CLI P_HOME P_RO[] P_RW[] P_CMD[]
+load_profile() {
+    local target="$1" in_section=0 found=0
+    P_NET=0; P_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0
+    P_HOME=""; P_RO=(); P_RW=(); P_CMD=(); P_NAME="$target"
+
+    [[ ! -f "$BCONT_CONFIG" ]] && die "Config not found: $BCONT_CONFIG — run: $PROG init"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%\#*}"                          # strip comments
+        line="${line#"${line%%[! ]*}"}"              # ltrim
+        line="${line%"${line##*[! ]}"}"              # rtrim
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" =~ ^\[([^]]+)\][[:space:]]*$ ]]; then
+            local sec="${BASH_REMATCH[1]}"
+            sec="${sec#"${sec%%[! ]*}"}"; sec="${sec%"${sec##*[! ]}"}"
+            if [[ "$sec" == "$target" ]]; then
+                in_section=1; found=1
+            elif [[ $in_section -eq 1 ]]; then
+                break
+            else
+                in_section=0
+            fi
+            continue
+        fi
+
+        [[ $in_section -eq 0 ]] && continue
+
+        if [[ "$line" =~ ^([a-zA-Z_-]+)[[:space:]]*=[[:space:]]*(.*) ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+            val="${val%"${val##*[! ]}"}"         # rtrim
+            val="${val#\"}"; val="${val%\"}"     # strip double quotes
+            val="${val#\'}"; val="${val%\'}"     # strip single quotes
+            val="${val/#\~/$HOME}"               # expand leading ~
+
+            case "$key" in
+                name)     P_NAME="$val" ;;
+                net)      [[ "$val" =~ ^(true|1|yes)$ ]]  && P_NET=1 ;;
+                dbus)     [[ "$val" =~ ^(true|1|yes)$ ]]  && P_DBUS=1 ;;
+                pipewire) [[ "$val" =~ ^(true|1|yes)$ ]]  && P_PIPEWIRE=1 ;;
+                gpu)
+                    case "$val" in
+                        true|full|1|yes) P_GPU=1 ;;
+                        render)          P_GPU=2 ;;
+                    esac ;;
+                cli)  [[ "$val" =~ ^(true|1|yes)$ ]] && P_CLI=1 ;;
+                home) P_HOME="$val" ;;
+                ro)   P_RO+=("$val") ;;
+                rw)   P_RW+=("$val") ;;
+                cmd)  read -ra P_CMD <<< "$val" ;;
+            esac
+        fi
+    done < "$BCONT_CONFIG"
+
+    [[ $found -eq 0 ]] && die "Profile '$target' not found in $BCONT_CONFIG"
+    log_debug "Loaded profile: $target"
+}
+
+list_profiles() {
+    if [[ ! -f "$BCONT_CONFIG" ]]; then
+        log_warn "No config file yet — run: $PROG init"
+        return
+    fi
+    printf '%sProfiles%s  (%s)\n' "$C_BOLD" "$C_RESET" "$BCONT_CONFIG"
+    local count=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[([^]]+)\] ]]; then
+            printf '  %s%s%s\n' "$C_CYA" "${BASH_REMATCH[1]}" "$C_RESET"
+            (( count++ )) || true
+        fi
+    done < "$BCONT_CONFIG"
+    [[ $count -eq 0 ]] && printf '  (none — add [name] sections to %s)\n' "$BCONT_CONFIG"
+}
+
+show_profile() {
+    local name="$1"
+    [[ ! -f "$BCONT_CONFIG" ]] && die "No config file: $BCONT_CONFIG"
+    local in_section=0 found=0
+    printf '%s[%s]%s\n' "$C_BOLD$C_CYA" "$name" "$C_RESET"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        local stripped="${line%%\#*}"
+        stripped="${stripped#"${stripped%%[! ]*}"}"; stripped="${stripped%"${stripped##*[! ]}"}"
+        if [[ "$stripped" =~ ^\[([^]]+)\] ]]; then
+            local sec="${BASH_REMATCH[1]}"
+            sec="${sec#"${sec%%[! ]*}"}"; sec="${sec%"${sec##*[! ]}"}"
+            if [[ "$sec" == "$name" ]]; then
+                in_section=1; found=1
+            elif [[ $in_section -eq 1 ]]; then
+                break
+            else
+                in_section=0
+            fi
+            continue
+        fi
+        [[ $in_section -eq 1 && -n "$stripped" ]] && printf '  %s\n' "$stripped"
+    done < "$BCONT_CONFIG"
+    [[ $found -eq 0 ]] && die "Profile '$name' not found in $BCONT_CONFIG"
+}
+
+cmd_init() {
+    local quiet="${1:-}"
+    if [[ -f "$BCONT_CONFIG" ]] && [[ "$quiet" != "--quiet" ]]; then
+        log_warn "Config already exists: $BCONT_CONFIG"
+        printf 'Overwrite? [y/N] '
+        read -r _ans
+        [[ "$_ans" =~ ^[Yy]$ ]] || { log_info "Aborted."; exit 0; }
+    fi
+    mkdir -p "$(dirname "$BCONT_CONFIG")"
+    cat > "$BCONT_CONFIG" << 'EOF'
+# bcont profiles — ~/.config/bcont/profiles
+#
+# Keys (all optional):
+#   name      = override sandbox name (default: profile section name)
+#   net       = true | false
+#   dbus      = true | false       (D-Bus portals proxy)
+#   pipewire  = true | false
+#   gpu       = full | render | false
+#   cli       = true | false       (no Wayland socket)
+#   home      = ~/path             (persistent home; omit for tmpfs)
+#   ro        = ~/path             (read-only bind, repeatable)
+#   rw        = ~/path             (read-write bind, repeatable)
+#   cmd       = command [args]
+#
+# Usage:
+#   bcont firefox                    # run this profile
+#   bcont firefox -N                 # profile + flag override
+#   bcont firefox -- --private-window  # profile + extra cmd args
+
+[firefox]
+net       = true
+dbus      = true
+pipewire  = true
+gpu       = full
+home      = ~/.local/share/bcont/firefox
+cmd       = firefox
+
+[mpv]
+gpu       = full
+ro        = ~/Videos
+cmd       = mpv
+
+[foot]
+cmd       = foot
+
+[zathura]
+gpu       = render
+ro        = ~/Documents
+cmd       = zathura
+EOF
+    log_ok "Created: $BCONT_CONFIG"
+    printf 'Edit with:  %s edit\n' "$PROG"
+    printf 'List with:  %s list\n' "$PROG"
+}
+
+cmd_completion() {
+    local shell="${1:-bash}"
+    case "$shell" in
+        bash) cat << 'BASH_COMP'
+# bcont bash completion — source this or drop in ~/.bash_completion.d/bcont
+_bcont_profiles() {
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/bcont/profiles"
+    [[ -f "$cfg" ]] || return
+    grep -oE '^\[[^]]+\]' "$cfg" | tr -d '[]'
+}
+_bcont() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local subcmds="list ls show edit init completion"
+    local opts="-n --name -N --net -d --dbus -p --pipewire -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$subcmds $(_bcont_profiles) $opts" -- "$cur") )
+    elif [[ "$prev" == "show" ]]; then
+        COMPREPLY=( $(compgen -W "$(_bcont_profiles)" -- "$cur") )
+    elif [[ "$prev" == "completion" ]]; then
+        COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+    elif [[ "$prev" == "-H" || "$prev" == "--home" || "$prev" == "--ro" || "$prev" == "--rw" ]]; then
+        COMPREPLY=( $(compgen -d -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+complete -F _bcont bcont
+BASH_COMP
+        ;;
+        zsh) cat << 'ZSH_COMP'
+# bcont zsh completion — save as a file named _bcont on your fpath, or source it
+_bcont() {
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/bcont/profiles"
+    local -a profiles=()
+    if [[ -f "$cfg" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^\[([^]]+)\] ]] && profiles+=("${match[1]}")
+        done < "$cfg"
+    fi
+    local -a subcmds=(
+        'list:List saved profiles'
+        'ls:List saved profiles (alias)'
+        'show:Show profile settings'
+        'edit:Open config in $EDITOR'
+        'init:Create starter config'
+        'completion:Print shell completion script'
+    )
+    _arguments -s \
+        '1: :->first' \
+        '*: :->rest' && return
+    case "$state" in
+        first)
+            _describe 'subcommand' subcmds
+            _describe 'profile' profiles
+            _arguments \
+                {-n,--name}'[Sandbox name]:name' \
+                {-N,--net}'[Enable network]' \
+                {-d,--dbus}'[D-Bus portals proxy]' \
+                {-p,--pipewire}'[PipeWire socket]' \
+                {-g,--gpu}'[Full GPU access]' \
+                '--gpu-render[Render nodes only]' \
+                {-s,--shell}'[Run shell instead of command]' \
+                {-H,--home}'[Persistent home]:dir:_directories' \
+                '--ro[Read-only bind]:path:_files' \
+                '--rw[Read-write bind]:path:_files' \
+                '--cli[Force CLI mode]' \
+                '--dry-run[Print command, do not run]' \
+                {-v,--verbose}'[Verbose output]' \
+                {-h,--help}'[Show help]'
+            ;;
+        rest)
+            case "${words[2]}" in
+                show)       _describe 'profile' profiles ;;
+                completion) _values 'shell' bash zsh ;;
+            esac
+            ;;
+    esac
+}
+_bcont "$@"
+ZSH_COMP
+        ;;
+        *) die "Unknown shell: $shell (supported: bash, zsh)" ;;
+    esac
+}
+
+# ── Subcommand dispatch ───────────────────────────────────────────────────────
+PROFILE_NAME=""
+
+case "${1:-}" in
+    list|ls)
+        list_profiles; exit 0 ;;
+    show)
+        [[ -z "${2:-}" ]] && die "Usage: $PROG show <profile>"
+        show_profile "$2"; exit 0 ;;
+    edit)
+        [[ -f "$BCONT_CONFIG" ]] || cmd_init --quiet
+        exec "${EDITOR:-vi}" "$BCONT_CONFIG" ;;
+    init)
+        cmd_init; exit 0 ;;
+    completion)
+        cmd_completion "${2:-bash}"; exit 0 ;;
+    -h|--help)
+        usage; exit 0 ;;
+    ""|--)
+        : ;;
+    -*)
+        : ;;  # option — normal processing below
+    *)
+        if _profile_exists "$1"; then
+            PROFILE_NAME="$1"; shift
+        fi
+        ;;
+esac
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 APP_NAME=""
@@ -71,14 +372,29 @@ ENABLE_PIPEWIRE=0
 ENABLE_GPU=0        # 0=none, 1=full, 2=render-only
 FORCE_CLI=0
 DRY_RUN=0
-VERBOSE=0
+SHELL_OVERRIDE=0
 HOME_DIR=""
 EXTRA_RO=()
 EXTRA_RW=()
 CMD=()
+P_CMD=()
 
-_short=n:NdpgH:vh
-_long=name:,net,dbus,pipewire,gpu,gpu-render,home:,ro:,rw:,cli,dry-run,verbose,help
+# Apply profile defaults before flag parsing (flags will override)
+if [[ -n "$PROFILE_NAME" ]]; then
+    load_profile "$PROFILE_NAME"
+    APP_NAME="${P_NAME:-$PROFILE_NAME}"
+    [[ $P_NET      -eq 1 ]] && ENABLE_NET=1
+    [[ $P_DBUS     -eq 1 ]] && ENABLE_DBUS=1
+    [[ $P_PIPEWIRE -eq 1 ]] && ENABLE_PIPEWIRE=1
+    [[ $P_GPU      -gt 0 ]] && ENABLE_GPU=$P_GPU
+    [[ $P_CLI      -eq 1 ]] && FORCE_CLI=1
+    [[ -n "$P_HOME"       ]] && HOME_DIR="$P_HOME"
+    EXTRA_RO+=("${P_RO[@]+"${P_RO[@]}"}")
+    EXTRA_RW+=("${P_RW[@]+"${P_RW[@]}"}")
+fi
+
+_short=n:NdpgsH:vh
+_long=name:,net,dbus,pipewire,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
 
 if ! PARSED=$(getopt -o "$_short" -l "$_long" -n "$PROG" -- "$@"); then
     printf 'Run: %s --help\n' "$PROG" >&2; exit 2
@@ -93,6 +409,7 @@ while true; do
         -p|--pipewire)   ENABLE_PIPEWIRE=1;                     shift   ;;
         -g|--gpu)        ENABLE_GPU=1;                          shift   ;;
            --gpu-render) ENABLE_GPU=2;                          shift   ;;
+        -s|--shell)      SHELL_OVERRIDE=1;                      shift   ;;
         -H|--home)       HOME_DIR="$2";                         shift 2 ;;
            --ro)         EXTRA_RO+=("$2");                      shift 2 ;;
            --rw)         EXTRA_RW+=("$2");                      shift 2 ;;
@@ -104,6 +421,20 @@ while true; do
         *)               die "Unknown option: $1 — run: ${PROG} --help" ;;
     esac
 done
+
+# Merge profile cmd with extra args from --
+if [[ -n "$PROFILE_NAME" ]]; then
+    if [[ ${#P_CMD[@]} -gt 0 && ${#CMD[@]} -gt 0 ]]; then
+        CMD=("${P_CMD[@]}" "${CMD[@]}")   # profile cmd + appended args
+    elif [[ ${#P_CMD[@]} -gt 0 ]]; then
+        CMD=("${P_CMD[@]}")
+    fi
+fi
+
+# --shell overrides the command entirely with the user's shell
+if [[ $SHELL_OVERRIDE -eq 1 ]]; then
+    CMD=("${SHELL:-/bin/bash}")
+fi
 
 [[ ${#CMD[@]} -eq 0 ]] && { usage; die "No command specified."; }
 
@@ -118,9 +449,6 @@ APP_ID="org.sandbox.${APP_NAME}"
 INSTANCE_ID="${APP_ID}.$$"
 
 # ── Wayland mode detection ────────────────────────────────────────────────────
-# CLI mode when:
-#   1. --cli flag is set, OR
-#   2. WAYLAND_DISPLAY is empty or unset
 WAYLAND_MODE=1
 if [[ $FORCE_CLI -eq 1 ]]; then
     WAYLAND_MODE=0
@@ -210,7 +538,6 @@ if [[ $WAYLAND_MODE -eq 1 ]]; then
             --listen-socket  "$SECCTX_SOCKET" &
         SECCTX_PID=$!
 
-        # Wait for socket, verifying the helper is still alive each iteration
         _tries=0
         while [[ $_tries -lt 40 ]]; do
             [[ -S "$SECCTX_SOCKET" ]] && break
@@ -229,7 +556,6 @@ if [[ $WAYLAND_MODE -eq 1 ]]; then
             --bind "$SECCTX_SOCKET" "$SANDBOX_XRD_INSIDE/wayland-1"
         )
     else
-        # Fallback: pass native socket through without filtering
         _NATIVE_WL="$REAL_XRD/${WAYLAND_DISPLAY:-wayland-1}"
         [[ -S "$_NATIVE_WL" ]] || die "Wayland socket not found: $_NATIVE_WL"
 
@@ -258,7 +584,6 @@ if [[ $WAYLAND_MODE -eq 1 ]]; then
         --unsetenv XAUTHORITY
     )
 else
-    # CLI mode: no Wayland socket, all display envs cleared
     WAYLAND_ENV_ARGS=(
         --unsetenv WAYLAND_DISPLAY
         --unsetenv DISPLAY
