@@ -58,8 +58,9 @@ usage() {
     printf '%sFLAGS%s  (all are on/off toggles unless noted with %sVALUE%s)\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
     printf '  %s-s, --shell%s        run \$SHELL inside the sandbox instead of the given command\n' "$C_BOLD" "$C_RESET"
     printf '  %s-N, --net%s          allow network access            [default: network blocked]\n' "$C_BOLD" "$C_RESET"
-    printf '  %s-d, --dbus%s         allow D-Bus via portal filter   [default: no D-Bus]\n'       "$C_BOLD" "$C_RESET"
-    printf '  %s-p, --pipewire%s     allow PipeWire audio socket     [default: no audio]\n'       "$C_BOLD" "$C_RESET"
+    printf '  %s-d, --dbus%s         allow session D-Bus via portal filter  [default: no D-Bus]\n'  "$C_BOLD" "$C_RESET"
+    printf '  %s-D, --system-dbus%s  allow system D-Bus (filtered)         [default: no]\n'       "$C_BOLD" "$C_RESET"
+    printf '  %s-p, --pipewire%s     allow PipeWire audio socket            [default: no audio]\n' "$C_BOLD" "$C_RESET"
     printf '  %s-g, --gpu%s          allow full GPU (/dev/dri)       [default: no GPU]\n'         "$C_BOLD" "$C_RESET"
     printf '      %s--gpu-render%s   allow render nodes only (no KMS/DRM)\n'                      "$C_BOLD" "$C_RESET"
     printf '      %s--cli%s          no Wayland socket (for headless / CLI-only apps)\n'          "$C_BOLD" "$C_RESET"
@@ -97,7 +98,7 @@ _profile_exists() {
 # Sets: P_NAME P_NET P_DBUS P_PIPEWIRE P_GPU P_CLI P_HOME P_RO[] P_RW[] P_CMD[]
 load_profile() {
     local target="$1" in_section=0 found=0
-    P_NET=0; P_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0
+    P_NET=0; P_DBUS=0; P_SYSTEM_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0
     P_HOME=""; P_RO=(); P_RW=(); P_CMD=(); P_NAME="$target"
 
     [[ ! -f "$BCONT_CONFIG" ]] && die "Config not found: $BCONT_CONFIG — run: $PROG init"
@@ -134,8 +135,9 @@ load_profile() {
             case "$key" in
                 name)     P_NAME="$val" ;;
                 net)      [[ "$val" =~ ^(true|1|yes)$ ]]  && P_NET=1 ;;
-                dbus)     [[ "$val" =~ ^(true|1|yes)$ ]]  && P_DBUS=1 ;;
-                pipewire) [[ "$val" =~ ^(true|1|yes)$ ]]  && P_PIPEWIRE=1 ;;
+                dbus)        [[ "$val" =~ ^(true|1|yes)$ ]] && P_DBUS=1 ;;
+                system_dbus) [[ "$val" =~ ^(true|1|yes)$ ]] && P_SYSTEM_DBUS=1 ;;
+                pipewire)    [[ "$val" =~ ^(true|1|yes)$ ]] && P_PIPEWIRE=1 ;;
                 gpu)
                     case "$val" in
                         true|full|1|yes) P_GPU=1 ;;
@@ -212,7 +214,8 @@ cmd_init() {
 # Keys (all optional):
 #   name      = override sandbox name (default: profile section name)
 #   net       = true | false
-#   dbus      = true | false       (D-Bus portals proxy)
+#   dbus        = true | false     (session D-Bus portals proxy)
+#   system_dbus = true | false     (system D-Bus: NetworkManager, UPower, login1, bluez)
 #   pipewire  = true | false
 #   gpu       = full | render | false
 #   cli       = true | false       (no Wayland socket)
@@ -227,12 +230,13 @@ cmd_init() {
 #   bcont firefox -- --private-window  # profile + extra cmd args
 
 [firefox]
-net       = true
-dbus      = true
-pipewire  = true
-gpu       = full
-home      = ~/.local/share/bcont/firefox
-cmd       = firefox
+net         = true
+dbus        = true
+system_dbus = true
+pipewire    = true
+gpu         = full
+home        = ~/.local/share/bcont/firefox
+cmd         = firefox
 
 [mpv]
 gpu       = full
@@ -265,7 +269,7 @@ _bcont_profiles() {
 _bcont() {
     local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
     local subcmds="list ls show edit init completion"
-    local opts="-n --name -N --net -d --dbus -p --pipewire -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
+    local opts="-n --name -N --net -d --dbus -D --system-dbus -p --pipewire -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$subcmds $(_bcont_profiles) $opts" -- "$cur") )
     elif [[ "$prev" == "show" ]]; then
@@ -309,7 +313,8 @@ _bcont() {
             _arguments \
                 {-n,--name}'[Sandbox name]:name' \
                 {-N,--net}'[Enable network]' \
-                {-d,--dbus}'[D-Bus portals proxy]' \
+                {-d,--dbus}'[Session D-Bus portals proxy]' \
+                {-D,--system-dbus}'[System D-Bus (filtered)]' \
                 {-p,--pipewire}'[PipeWire socket]' \
                 {-g,--gpu}'[Full GPU access]' \
                 '--gpu-render[Render nodes only]' \
@@ -370,6 +375,7 @@ esac
 APP_NAME=""
 ENABLE_NET=0
 ENABLE_DBUS=0
+ENABLE_SYSTEM_DBUS=0
 ENABLE_PIPEWIRE=0
 ENABLE_GPU=0        # 0=none, 1=full, 2=render-only
 FORCE_CLI=0
@@ -385,9 +391,10 @@ P_CMD=()
 if [[ -n "$PROFILE_NAME" ]]; then
     load_profile "$PROFILE_NAME"
     APP_NAME="${P_NAME:-$PROFILE_NAME}"
-    [[ $P_NET      -eq 1 ]] && ENABLE_NET=1
-    [[ $P_DBUS     -eq 1 ]] && ENABLE_DBUS=1
-    [[ $P_PIPEWIRE -eq 1 ]] && ENABLE_PIPEWIRE=1
+    [[ $P_NET         -eq 1 ]] && ENABLE_NET=1
+    [[ $P_DBUS        -eq 1 ]] && ENABLE_DBUS=1
+    [[ $P_SYSTEM_DBUS -eq 1 ]] && ENABLE_SYSTEM_DBUS=1
+    [[ $P_PIPEWIRE    -eq 1 ]] && ENABLE_PIPEWIRE=1
     [[ $P_GPU      -gt 0 ]] && ENABLE_GPU=$P_GPU
     [[ $P_CLI      -eq 1 ]] && FORCE_CLI=1
     [[ -n "$P_HOME"       ]] && HOME_DIR="$P_HOME"
@@ -395,8 +402,8 @@ if [[ -n "$PROFILE_NAME" ]]; then
     EXTRA_RW+=("${P_RW[@]+"${P_RW[@]}"}")
 fi
 
-_short=n:NdpgsH:vh
-_long=name:,net,dbus,pipewire,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
+_short=n:NdDpgsH:vh
+_long=name:,net,dbus,system-dbus,pipewire,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
 
 if ! PARSED=$(getopt -o "$_short" -l "$_long" -n "$PROG" -- "$@"); then
     printf 'Run: %s --help\n' "$PROG" >&2; exit 2
@@ -407,8 +414,9 @@ while true; do
     case "$1" in
         -n|--name)       APP_NAME="$2";                         shift 2 ;;
         -N|--net)        ENABLE_NET=1;                          shift   ;;
-        -d|--dbus)       ENABLE_DBUS=1;                         shift   ;;
-        -p|--pipewire)   ENABLE_PIPEWIRE=1;                     shift   ;;
+        -d|--dbus)        ENABLE_DBUS=1;                        shift   ;;
+        -D|--system-dbus) ENABLE_SYSTEM_DBUS=1;                shift   ;;
+        -p|--pipewire)    ENABLE_PIPEWIRE=1;                   shift   ;;
         -g|--gpu)        ENABLE_GPU=1;                          shift   ;;
            --gpu-render) ENABLE_GPU=2;                          shift   ;;
         -s|--shell)      SHELL_OVERRIDE=1;                      shift   ;;
@@ -478,7 +486,7 @@ _check_dep() {
 _check_dep bwrap
 _check_dep jq
 [[ $WAYLAND_MODE -eq 1 ]] && _check_dep swaymsg
-[[ $ENABLE_DBUS  -eq 1 ]] && _check_dep xdg-dbus-proxy
+[[ $ENABLE_DBUS -eq 1 || $ENABLE_SYSTEM_DBUS -eq 1 ]] && _check_dep xdg-dbus-proxy
 
 HAS_SECCTX_HELPER=0
 if [[ $WAYLAND_MODE -eq 1 ]]; then
@@ -504,6 +512,7 @@ chmod 700 "$SANDBOX_XRD_HOST"
 log_debug "Sandbox runtime dir (host): $SANDBOX_XRD_HOST"
 
 DBUS_PROXY_PID=""
+SYSTEM_DBUS_PROXY_PID=""
 SECCTX_PID=""
 SECCTX_SOCKET=""
 
@@ -513,6 +522,11 @@ cleanup() {
     if [[ -n "$DBUS_PROXY_PID" ]] && kill -0 "$DBUS_PROXY_PID" 2>/dev/null; then
         kill "$DBUS_PROXY_PID" 2>/dev/null || true
         wait "$DBUS_PROXY_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$SYSTEM_DBUS_PROXY_PID" ]] && kill -0 "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null; then
+        kill "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null || true
+        wait "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null || true
     fi
 
     if [[ -n "$SECCTX_PID" ]] && kill -0 "$SECCTX_PID" 2>/dev/null; then
@@ -639,6 +653,51 @@ if [[ $ENABLE_DBUS -eq 1 ]]; then
     DBUS_ARGS=(
         --bind   "$PROXY_SOCKET_HOST"     "$PROXY_SOCKET_INSIDE"
         --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$PROXY_SOCKET_INSIDE"
+    )
+fi
+
+# ── System D-Bus proxy ────────────────────────────────────────────────────────
+SYSTEM_DBUS_ARGS=()
+if [[ $ENABLE_SYSTEM_DBUS -eq 1 ]]; then
+    _SYSBUS_SOCK=/run/dbus/system_bus_socket
+    [[ -S "$_SYSBUS_SOCK" ]] || die "System D-Bus socket not found: $_SYSBUS_SOCK"
+
+    SYSTEM_PROXY_SOCKET_HOST="$SANDBOX_XRD_HOST/system_bus_socket"
+
+    xdg-dbus-proxy \
+        "unix:path=$_SYSBUS_SOCK" \
+        "$SYSTEM_PROXY_SOCKET_HOST" \
+        --filter \
+        --talk=org.freedesktop.NetworkManager \
+        --talk=org.freedesktop.UPower \
+        --talk=org.freedesktop.login1 \
+        --talk=org.freedesktop.PolicyKit1 \
+        --talk=org.bluez \
+        --call="org.freedesktop.NetworkManager=*" \
+        --call="org.freedesktop.UPower=*" \
+        --call="org.freedesktop.login1=*" \
+        --broadcast="org.freedesktop.NetworkManager.*=@/org/freedesktop/NetworkManager/*" \
+        --broadcast="org.freedesktop.UPower.*=@/org/freedesktop/UPower/*" \
+        --broadcast="org.freedesktop.login1.*=@/org/freedesktop/login1/*" \
+        &
+    SYSTEM_DBUS_PROXY_PID=$!
+
+    _tries=0
+    while [[ $_tries -lt 40 ]]; do
+        [[ -S "$SYSTEM_PROXY_SOCKET_HOST" ]] && break
+        if ! kill -0 "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null; then
+            die "xdg-dbus-proxy (system bus) exited immediately"
+        fi
+        sleep 0.05
+        (( _tries++ )) || true
+    done
+    [[ -S "$SYSTEM_PROXY_SOCKET_HOST" ]] \
+        || die "System D-Bus proxy socket not created: $SYSTEM_PROXY_SOCKET_HOST"
+
+    log_ok "System D-Bus proxy ready (PID: $SYSTEM_DBUS_PROXY_PID)"
+
+    SYSTEM_DBUS_ARGS=(
+        --bind "$SYSTEM_PROXY_SOCKET_HOST" "$_SYSBUS_SOCK"
     )
 fi
 
@@ -820,8 +879,11 @@ BWRAP_ARGS=(
     # Wayland socket (empty in CLI mode)
     "${WAYLAND_SOCKET_ARGS[@]+"${WAYLAND_SOCKET_ARGS[@]}"}"
 
-    # D-Bus proxy
+    # D-Bus proxy (session)
     "${DBUS_ARGS[@]+"${DBUS_ARGS[@]}"}"
+
+    # D-Bus proxy (system)
+    "${SYSTEM_DBUS_ARGS[@]+"${SYSTEM_DBUS_ARGS[@]}"}"
 
     # PipeWire
     "${PIPEWIRE_ARGS[@]+"${PIPEWIRE_ARGS[@]}"}"
@@ -873,7 +935,7 @@ fi
 if [[ $VERBOSE -eq 1 ]]; then
     log_debug "Starting: $APP_NAME ($APP_ID)"
     log_debug "Command:  ${CMD[*]}"
-    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU"
+    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | system-dbus: $ENABLE_SYSTEM_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU"
 fi
 
 # ── Execute ───────────────────────────────────────────────────────────────────
