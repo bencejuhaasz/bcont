@@ -63,6 +63,7 @@ usage() {
     printf '  %s-p, --pipewire%s     allow PipeWire audio socket            [default: no audio]\n' "$C_BOLD" "$C_RESET"
     printf '  %s-g, --gpu%s          allow full GPU (/dev/dri)       [default: no GPU]\n'         "$C_BOLD" "$C_RESET"
     printf '      %s--gpu-render%s   allow render nodes only (no KMS/DRM)\n'                      "$C_BOLD" "$C_RESET"
+    printf '  %s-F, --fido%s         allow FIDO2/U2F security keys (/dev/hidraw*) [default: no]\n' "$C_BOLD" "$C_RESET"
     printf '      %s--cli%s          no Wayland socket (for headless / CLI-only apps)\n'          "$C_BOLD" "$C_RESET"
     printf '  %s-H, --home%s %sDIR%s    persistent home directory       [default: empty tmpfs]\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
     printf '      %s--ro%s %sPATH%s     bind a path read-only inside the sandbox (repeatable)\n'  "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
@@ -98,7 +99,7 @@ _profile_exists() {
 # Sets: P_NAME P_NET P_DBUS P_PIPEWIRE P_GPU P_CLI P_HOME P_RO[] P_RW[] P_CMD[]
 load_profile() {
     local target="$1" in_section=0 found=0
-    P_NET=0; P_DBUS=0; P_SYSTEM_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0
+    P_NET=0; P_DBUS=0; P_SYSTEM_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0; P_FIDO=0
     P_HOME=""; P_RO=(); P_RW=(); P_CMD=(); P_NAME="$target"
 
     [[ ! -f "$BCONT_CONFIG" ]] && die "Config not found: $BCONT_CONFIG — run: $PROG init"
@@ -144,6 +145,7 @@ load_profile() {
                         render)          P_GPU=2 ;;
                     esac ;;
                 cli)  [[ "$val" =~ ^(true|1|yes)$ ]] && P_CLI=1 ;;
+                fido) [[ "$val" =~ ^(true|1|yes)$ ]] && P_FIDO=1 ;;
                 home) P_HOME="$val" ;;
                 ro)   P_RO+=("$val") ;;
                 rw)   P_RW+=("$val") ;;
@@ -219,6 +221,7 @@ cmd_init() {
 #   pipewire  = true | false
 #   gpu       = full | render | false
 #   cli       = true | false       (no Wayland socket)
+#   fido      = true | false       (FIDO2/U2F security keys via /dev/hidraw*)
 #   home      = ~/path             (persistent home; omit for tmpfs)
 #   ro        = ~/path             (read-only bind, repeatable)
 #   rw        = ~/path             (read-write bind, repeatable)
@@ -235,6 +238,7 @@ dbus        = true
 system_dbus = true
 pipewire    = true
 gpu         = full
+fido        = true
 home        = ~/.local/share/bcont/firefox
 cmd         = firefox
 
@@ -269,7 +273,7 @@ _bcont_profiles() {
 _bcont() {
     local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
     local subcmds="list ls show edit init completion"
-    local opts="-n --name -N --net -d --dbus -D --system-dbus -p --pipewire -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
+    local opts="-n --name -N --net -d --dbus -D --system-dbus -p --pipewire -F --fido -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$subcmds $(_bcont_profiles) $opts" -- "$cur") )
     elif [[ "$prev" == "show" ]]; then
@@ -316,6 +320,7 @@ _bcont() {
                 {-d,--dbus}'[Session D-Bus portals proxy]' \
                 {-D,--system-dbus}'[System D-Bus (filtered)]' \
                 {-p,--pipewire}'[PipeWire socket]' \
+                {-F,--fido}'[FIDO2/U2F security keys]' \
                 {-g,--gpu}'[Full GPU access]' \
                 '--gpu-render[Render nodes only]' \
                 {-s,--shell}'[Run shell instead of command]' \
@@ -378,6 +383,7 @@ ENABLE_DBUS=0
 ENABLE_SYSTEM_DBUS=0
 ENABLE_PIPEWIRE=0
 ENABLE_GPU=0        # 0=none, 1=full, 2=render-only
+ENABLE_FIDO=0
 FORCE_CLI=0
 DRY_RUN=0
 SHELL_OVERRIDE=0
@@ -396,14 +402,15 @@ if [[ -n "$PROFILE_NAME" ]]; then
     [[ $P_SYSTEM_DBUS -eq 1 ]] && ENABLE_SYSTEM_DBUS=1
     [[ $P_PIPEWIRE    -eq 1 ]] && ENABLE_PIPEWIRE=1
     [[ $P_GPU      -gt 0 ]] && ENABLE_GPU=$P_GPU
+    [[ $P_FIDO     -eq 1 ]] && ENABLE_FIDO=1
     [[ $P_CLI      -eq 1 ]] && FORCE_CLI=1
     [[ -n "$P_HOME"       ]] && HOME_DIR="$P_HOME"
     EXTRA_RO+=("${P_RO[@]+"${P_RO[@]}"}")
     EXTRA_RW+=("${P_RW[@]+"${P_RW[@]}"}")
 fi
 
-_short=n:NdDpgsH:vh
-_long=name:,net,dbus,system-dbus,pipewire,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
+_short=n:NdDpFgsH:vh
+_long=name:,net,dbus,system-dbus,pipewire,fido,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
 
 if ! PARSED=$(getopt -o "$_short" -l "$_long" -n "$PROG" -- "$@"); then
     printf 'Run: %s --help\n' "$PROG" >&2; exit 2
@@ -417,6 +424,7 @@ while true; do
         -d|--dbus)        ENABLE_DBUS=1;                        shift   ;;
         -D|--system-dbus) ENABLE_SYSTEM_DBUS=1;                shift   ;;
         -p|--pipewire)    ENABLE_PIPEWIRE=1;                   shift   ;;
+        -F|--fido)        ENABLE_FIDO=1;                       shift   ;;
         -g|--gpu)        ENABLE_GPU=1;                          shift   ;;
            --gpu-render) ENABLE_GPU=2;                          shift   ;;
         -s|--shell)      SHELL_OVERRIDE=1;                      shift   ;;
@@ -763,6 +771,28 @@ elif [[ $ENABLE_GPU -eq 2 ]]; then
     fi
 fi
 
+# ── FIDO2/U2F (HID security keys) ────────────────────────────────────────────
+# Chromium-based browsers talk to FIDO2/U2F keys directly via /dev/hidraw*.
+# They enumerate /sys/class/hidraw to discover devices and follow symlinks into
+# /sys/devices to read HID attributes, so both sysfs paths are required.
+FIDO_ARGS=()
+if [[ $ENABLE_FIDO -eq 1 ]]; then
+    _fido_count=0
+    for _h in /dev/hidraw*; do
+        [[ -c "$_h" ]] || continue
+        FIDO_ARGS+=( --dev-bind "$_h" "$_h" )
+        (( _fido_count++ )) || true
+    done
+    if [[ $_fido_count -eq 0 ]]; then
+        log_warn "No /dev/hidraw* devices found — --fido has no effect."
+    else
+        [[ -d /sys/class/hidraw ]] && FIDO_ARGS+=( --ro-bind /sys/class/hidraw /sys/class/hidraw )
+        # /sys/devices is already bound when GPU is enabled; avoid a duplicate.
+        [[ $ENABLE_GPU -eq 0 && -d /sys/devices ]] && FIDO_ARGS+=( --ro-bind /sys/devices /sys/devices )
+        log_debug "FIDO2/U2F: bound $_fido_count /dev/hidraw* device(s)"
+    fi
+fi
+
 # ── Network ───────────────────────────────────────────────────────────────────
 NET_ARGS=( --unshare-net )
 if [[ $ENABLE_NET -eq 1 ]]; then
@@ -891,6 +921,9 @@ BWRAP_ARGS=(
     # GPU
     "${GPU_ARGS[@]+"${GPU_ARGS[@]}"}"
 
+    # FIDO2/U2F
+    "${FIDO_ARGS[@]+"${FIDO_ARGS[@]}"}"
+
     # Home
     "${HOME_ARGS[@]}"
 
@@ -935,7 +968,7 @@ fi
 if [[ $VERBOSE -eq 1 ]]; then
     log_debug "Starting: $APP_NAME ($APP_ID)"
     log_debug "Command:  ${CMD[*]}"
-    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | system-dbus: $ENABLE_SYSTEM_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU"
+    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | system-dbus: $ENABLE_SYSTEM_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU | fido: $ENABLE_FIDO"
 fi
 
 # ── Execute ───────────────────────────────────────────────────────────────────
