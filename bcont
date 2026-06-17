@@ -745,12 +745,14 @@ _bind_nvidia() {
 }
 
 _bind_gpu_sysfs() {
-    # No sysfs binds: every /sys path we tried (/sys/devices wholesale,
-    # /sys/dev/char, /sys/class/drm, /sys/bus/pci, per-device PCI subtrees)
-    # can hang bwrap's namespace setup on hardware with slow/blocking kernel
-    # sysfs objects.  Mesa uses DRM ioctls on the open fd to identify the GPU;
-    # sysfs is not required for rendering or Vulkan.
-    [[ -d /sys/module/nvidia ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia /sys/module/nvidia ) || true
+    [[ -d /sys/dev/char       ]] && GPU_ARGS+=( --ro-bind /sys/dev/char       /sys/dev/char       ) || true
+    [[ -d /sys/devices        ]] && GPU_ARGS+=( --ro-bind /sys/devices        /sys/devices        ) || true
+    [[ -d /sys/class/drm      ]] && GPU_ARGS+=( --ro-bind /sys/class/drm      /sys/class/drm      ) || true
+    [[ -d /sys/bus/pci        ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci        /sys/bus/pci        ) || true
+    # /sys/module/nvidia is required by NVML to enumerate GPUs; without it,
+    # both nvidia-smi and vkEnumeratePhysicalDevices fail with "GPU access
+    # blocked by the operating system".
+    [[ -d /sys/module/nvidia  ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia  /sys/module/nvidia  ) || true
 }
 
 GPU_ARGS=()
@@ -779,40 +781,21 @@ fi
 # ── FIDO2/U2F (HID security keys) ────────────────────────────────────────────
 # Chromium-based browsers talk to FIDO2/U2F keys directly via /dev/hidraw*.
 # They enumerate /sys/class/hidraw to discover devices and follow symlinks into
-# /sys/devices to read HID attributes; we bind the per-device sysfs subtree
-# rather than /sys/devices wholesale.
-_bind_hid_sysfs_for_node() {
-    local devnode="$1" hex_maj hex_min major minor charlink devpath hwdev
-    hex_maj=$(timeout 2 stat -c "%t" "$devnode" 2>/dev/null) || return 0
-    hex_min=$(timeout 2 stat -c "%T" "$devnode" 2>/dev/null) || return 0
-    [[ -n "$hex_maj" && -n "$hex_min" ]] || return 0
-    major=$(( 16#$hex_maj ))
-    minor=$(( 16#$hex_min ))
-    charlink="/sys/dev/char/${major}:${minor}"
-    [[ -L "$charlink" ]] || return 0
-    devpath="$(timeout 2 readlink -f "$charlink" 2>/dev/null)" || return 0
-    [[ -d "$devpath" ]] || return 0
-    # Layout: /sys/devices/…/<hw-device>/hidraw/hidraw0
-    hwdev="$(dirname "$(dirname "$devpath")")"
-    [[ "$hwdev" =~ ^/sys/devices/. ]] || return 0
-    [[ -d "$hwdev" ]] || return 0
-    FIDO_ARGS+=( --ro-bind "$hwdev" "$hwdev" )
-    log_debug "FIDO sysfs: $hwdev"
-}
-
+# /sys/devices to read HID attributes, so both sysfs paths are required.
 FIDO_ARGS=()
 if [[ $ENABLE_FIDO -eq 1 ]]; then
     _fido_count=0
     for _h in /dev/hidraw*; do
         [[ -c "$_h" ]] || continue
         FIDO_ARGS+=( --dev-bind "$_h" "$_h" )
-        _bind_hid_sysfs_for_node "$_h"
         (( _fido_count++ )) || true
     done
     if [[ $_fido_count -eq 0 ]]; then
         log_warn "No /dev/hidraw* devices found — --fido has no effect."
     else
         [[ -d /sys/class/hidraw ]] && FIDO_ARGS+=( --ro-bind /sys/class/hidraw /sys/class/hidraw ) || true
+        # /sys/devices is already bound when GPU is enabled; avoid a duplicate.
+        [[ $ENABLE_GPU -eq 0 && -d /sys/devices ]] && FIDO_ARGS+=( --ro-bind /sys/devices /sys/devices ) || true
         log_debug "FIDO2/U2F: bound $_fido_count /dev/hidraw* device(s)"
     fi
 fi
