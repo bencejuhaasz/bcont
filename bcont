@@ -529,16 +529,19 @@ cleanup() {
 
     if [[ -n "$DBUS_PROXY_PID" ]] && kill -0 "$DBUS_PROXY_PID" 2>/dev/null; then
         kill "$DBUS_PROXY_PID" 2>/dev/null || true
+        kill -9 "$DBUS_PROXY_PID" 2>/dev/null || true
         wait "$DBUS_PROXY_PID" 2>/dev/null || true
     fi
 
     if [[ -n "$SYSTEM_DBUS_PROXY_PID" ]] && kill -0 "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null; then
         kill "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null || true
+        kill -9 "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null || true
         wait "$SYSTEM_DBUS_PROXY_PID" 2>/dev/null || true
     fi
 
     if [[ -n "$SECCTX_PID" ]] && kill -0 "$SECCTX_PID" 2>/dev/null; then
         kill "$SECCTX_PID" 2>/dev/null || true
+        kill -9 "$SECCTX_PID" 2>/dev/null || true
         wait "$SECCTX_PID" 2>/dev/null || true
     fi
 
@@ -738,7 +741,7 @@ _bind_nvidia() {
         GPU_ARGS+=( --dev-bind /dev/nvidia-caps /dev/nvidia-caps )
         found=1
     fi
-    [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*, /dev/nvidia-caps)."
+    [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*, /dev/nvidia-caps)." || true
 }
 
 _bind_gpu_sysfs() {
@@ -747,7 +750,7 @@ _bind_gpu_sysfs() {
     # can hang bwrap's namespace setup on hardware with slow/blocking kernel
     # sysfs objects.  Mesa uses DRM ioctls on the open fd to identify the GPU;
     # sysfs is not required for rendering or Vulkan.
-    [[ -d /sys/module/nvidia ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia /sys/module/nvidia )
+    [[ -d /sys/module/nvidia ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia /sys/module/nvidia ) || true
 }
 
 GPU_ARGS=()
@@ -809,7 +812,7 @@ if [[ $ENABLE_FIDO -eq 1 ]]; then
     if [[ $_fido_count -eq 0 ]]; then
         log_warn "No /dev/hidraw* devices found — --fido has no effect."
     else
-        [[ -d /sys/class/hidraw ]] && FIDO_ARGS+=( --ro-bind /sys/class/hidraw /sys/class/hidraw )
+        [[ -d /sys/class/hidraw ]] && FIDO_ARGS+=( --ro-bind /sys/class/hidraw /sys/class/hidraw ) || true
         log_debug "FIDO2/U2F: bound $_fido_count /dev/hidraw* device(s)"
     fi
 fi
