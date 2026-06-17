@@ -1,6 +1,6 @@
 # Maintainer: bencejuhaasz <juhaszbence2001@gmail.com>
 pkgname=bcont-git
-pkgver=r22.90d0757
+pkgver=r24.b662a21
 pkgrel=1
 pkgdesc="Bubblewrap sandbox with Wayland security-context for Sway"
 arch=(x86_64 aarch64)
