@@ -741,32 +741,64 @@ _bind_nvidia() {
     [[ $found -eq 1 ]] && log_debug "NVIDIA devices bound (/dev/nvidia*, /dev/nvidia-caps)."
 }
 
+_bind_dri_sysfs_for_node() {
+    # Resolve a DRI device node to its sysfs hardware-device directory and bind
+    # only that subtree — avoids binding /sys/devices wholesale, which hangs on
+    # systems with certain hardware (Surface SAM, IME, proprietary platform buses).
+    local devnode="$1" hex_maj hex_min major minor charlink devpath hwdev
+    hex_maj=$(stat -c "%t" "$devnode" 2>/dev/null) || return 0
+    hex_min=$(stat -c "%T" "$devnode" 2>/dev/null) || return 0
+    [[ -n "$hex_maj" && -n "$hex_min" ]] || return 0
+    major=$(( 16#$hex_maj ))
+    minor=$(( 16#$hex_min ))
+    charlink="/sys/dev/char/${major}:${minor}"
+    [[ -L "$charlink" ]] || return 0
+    devpath="$(readlink -f "$charlink")" || return 0
+    [[ -d "$devpath" ]] || return 0
+    # Layout: /sys/devices/…/<hw-device>/drm/renderD128
+    # Two levels up reaches the hardware device directory (PCI slot, platform dev, etc.)
+    hwdev="$(dirname "$(dirname "$devpath")")"
+    [[ "$hwdev" =~ ^/sys/devices/. ]] || return 0
+    [[ -d "$hwdev" ]] || return 0
+    GPU_ARGS+=( --ro-bind "$hwdev" "$hwdev" )
+    log_debug "GPU sysfs: $hwdev"
+}
+
 _bind_gpu_sysfs() {
-    [[ -d /sys/dev/char       ]] && GPU_ARGS+=( --ro-bind /sys/dev/char       /sys/dev/char       )
-    [[ -d /sys/devices        ]] && GPU_ARGS+=( --ro-bind /sys/devices        /sys/devices        )
-    [[ -d /sys/class/drm      ]] && GPU_ARGS+=( --ro-bind /sys/class/drm      /sys/class/drm      )
-    [[ -d /sys/bus/pci        ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci        /sys/bus/pci        )
-    # /sys/module/nvidia is required by NVML to enumerate GPUs; without it,
-    # both nvidia-smi and vkEnumeratePhysicalDevices fail with "GPU access
-    # blocked by the operating system".
-    [[ -d /sys/module/nvidia  ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia  /sys/module/nvidia  )
+    # Bind per-device sysfs subtrees (passed as args) instead of /sys/devices.
+    local _node
+    for _node in "$@"; do
+        _bind_dri_sysfs_for_node "$_node"
+    done
+    [[ -d /sys/dev/char      ]] && GPU_ARGS+=( --ro-bind /sys/dev/char      /sys/dev/char      )
+    [[ -d /sys/class/drm     ]] && GPU_ARGS+=( --ro-bind /sys/class/drm     /sys/class/drm     )
+    [[ -d /sys/bus/pci       ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci       /sys/bus/pci       )
+    [[ -d /sys/module/nvidia ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia /sys/module/nvidia )
 }
 
 GPU_ARGS=()
 if [[ $ENABLE_GPU -eq 1 ]]; then
     GPU_ARGS+=( --dev-bind /dev/dri /dev/dri )
     _bind_nvidia
-    _bind_gpu_sysfs
+    _dri_nodes=()
+    for _n in /dev/dri/card* /dev/dri/renderD*; do
+        [[ -c "$_n" ]] && _dri_nodes+=("$_n")
+    done
+    _bind_gpu_sysfs "${_dri_nodes[@]+"${_dri_nodes[@]}"}"
     log_debug "GPU: full /dev/dri (card* + renderD*)"
 elif [[ $ENABLE_GPU -eq 2 ]]; then
+    _render_nodes=()
     for _node in /dev/dri/renderD*; do
-        [[ -c "$_node" ]] && GPU_ARGS+=( --dev-bind "$_node" "$_node" )
+        if [[ -c "$_node" ]]; then
+            GPU_ARGS+=( --dev-bind "$_node" "$_node" )
+            _render_nodes+=("$_node")
+        fi
     done
-    if [[ ${#GPU_ARGS[@]} -eq 0 ]]; then
+    if [[ ${#_render_nodes[@]} -eq 0 ]]; then
         log_warn "No /dev/dri/renderD* nodes found — --gpu-render has no effect."
     else
         _bind_nvidia
-        _bind_gpu_sysfs
+        _bind_gpu_sysfs "${_render_nodes[@]}"
         log_debug "GPU: render-only nodes bound."
     fi
 fi
@@ -774,21 +806,40 @@ fi
 # ── FIDO2/U2F (HID security keys) ────────────────────────────────────────────
 # Chromium-based browsers talk to FIDO2/U2F keys directly via /dev/hidraw*.
 # They enumerate /sys/class/hidraw to discover devices and follow symlinks into
-# /sys/devices to read HID attributes, so both sysfs paths are required.
+# /sys/devices to read HID attributes; we bind the per-device sysfs subtree
+# rather than /sys/devices wholesale.
+_bind_hid_sysfs_for_node() {
+    local devnode="$1" hex_maj hex_min major minor charlink devpath hwdev
+    hex_maj=$(stat -c "%t" "$devnode" 2>/dev/null) || return 0
+    hex_min=$(stat -c "%T" "$devnode" 2>/dev/null) || return 0
+    [[ -n "$hex_maj" && -n "$hex_min" ]] || return 0
+    major=$(( 16#$hex_maj ))
+    minor=$(( 16#$hex_min ))
+    charlink="/sys/dev/char/${major}:${minor}"
+    [[ -L "$charlink" ]] || return 0
+    devpath="$(readlink -f "$charlink")" || return 0
+    [[ -d "$devpath" ]] || return 0
+    # Layout: /sys/devices/…/<hw-device>/hidraw/hidraw0
+    hwdev="$(dirname "$(dirname "$devpath")")"
+    [[ "$hwdev" =~ ^/sys/devices/. ]] || return 0
+    [[ -d "$hwdev" ]] || return 0
+    FIDO_ARGS+=( --ro-bind "$hwdev" "$hwdev" )
+    log_debug "FIDO sysfs: $hwdev"
+}
+
 FIDO_ARGS=()
 if [[ $ENABLE_FIDO -eq 1 ]]; then
     _fido_count=0
     for _h in /dev/hidraw*; do
         [[ -c "$_h" ]] || continue
         FIDO_ARGS+=( --dev-bind "$_h" "$_h" )
+        _bind_hid_sysfs_for_node "$_h"
         (( _fido_count++ )) || true
     done
     if [[ $_fido_count -eq 0 ]]; then
         log_warn "No /dev/hidraw* devices found — --fido has no effect."
     else
         [[ -d /sys/class/hidraw ]] && FIDO_ARGS+=( --ro-bind /sys/class/hidraw /sys/class/hidraw )
-        # /sys/devices is already bound when GPU is enabled; avoid a duplicate.
-        [[ $ENABLE_GPU -eq 0 && -d /sys/devices ]] && FIDO_ARGS+=( --ro-bind /sys/devices /sys/devices )
         log_debug "FIDO2/U2F: bound $_fido_count /dev/hidraw* device(s)"
     fi
 fi
