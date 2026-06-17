@@ -742,18 +742,18 @@ _bind_nvidia() {
 }
 
 _bind_dri_sysfs_for_node() {
-    # Resolve a DRI device node to its sysfs hardware-device directory and bind
-    # only that subtree — avoids binding /sys/devices wholesale, which hangs on
-    # systems with certain hardware (Surface SAM, IME, proprietary platform buses).
+    # Bind only the specific hardware-device sysfs subtree for this DRI node.
+    # timeout guards every sysfs call — certain GPU drivers (i915 on Surface,
+    # proprietary platform buses) can block indefinitely on stat/readlink.
     local devnode="$1" hex_maj hex_min major minor charlink devpath hwdev
-    hex_maj=$(stat -c "%t" "$devnode" 2>/dev/null) || return 0
-    hex_min=$(stat -c "%T" "$devnode" 2>/dev/null) || return 0
+    hex_maj=$(timeout 2 stat -c "%t" "$devnode" 2>/dev/null) || return 0
+    hex_min=$(timeout 2 stat -c "%T" "$devnode" 2>/dev/null) || return 0
     [[ -n "$hex_maj" && -n "$hex_min" ]] || return 0
     major=$(( 16#$hex_maj ))
     minor=$(( 16#$hex_min ))
     charlink="/sys/dev/char/${major}:${minor}"
     [[ -L "$charlink" ]] || return 0
-    devpath="$(readlink -f "$charlink")" || return 0
+    devpath="$(timeout 2 readlink -f "$charlink" 2>/dev/null)" || return 0
     [[ -d "$devpath" ]] || return 0
     # Layout: /sys/devices/…/<hw-device>/drm/renderD128
     # Two levels up reaches the hardware device directory (PCI slot, platform dev, etc.)
@@ -765,14 +765,15 @@ _bind_dri_sysfs_for_node() {
 }
 
 _bind_gpu_sysfs() {
-    # Bind per-device sysfs subtrees (passed as args) instead of /sys/devices.
+    # Bind only per-device sysfs subtrees. Do NOT bind broad directories like
+    # /sys/dev/char, /sys/class/drm, or /sys/bus/pci — these can hang bwrap's
+    # namespace setup on hardware with slow/blocking kernel sysfs objects.
+    # Mesa identifies the GPU via DRM ioctls on the open fd; broad sysfs
+    # enumeration dirs are not required for rendering.
     local _node
     for _node in "$@"; do
         _bind_dri_sysfs_for_node "$_node"
     done
-    [[ -d /sys/dev/char      ]] && GPU_ARGS+=( --ro-bind /sys/dev/char      /sys/dev/char      )
-    [[ -d /sys/class/drm     ]] && GPU_ARGS+=( --ro-bind /sys/class/drm     /sys/class/drm     )
-    [[ -d /sys/bus/pci       ]] && GPU_ARGS+=( --ro-bind /sys/bus/pci       /sys/bus/pci       )
     [[ -d /sys/module/nvidia ]] && GPU_ARGS+=( --ro-bind /sys/module/nvidia /sys/module/nvidia )
 }
 
@@ -810,14 +811,14 @@ fi
 # rather than /sys/devices wholesale.
 _bind_hid_sysfs_for_node() {
     local devnode="$1" hex_maj hex_min major minor charlink devpath hwdev
-    hex_maj=$(stat -c "%t" "$devnode" 2>/dev/null) || return 0
-    hex_min=$(stat -c "%T" "$devnode" 2>/dev/null) || return 0
+    hex_maj=$(timeout 2 stat -c "%t" "$devnode" 2>/dev/null) || return 0
+    hex_min=$(timeout 2 stat -c "%T" "$devnode" 2>/dev/null) || return 0
     [[ -n "$hex_maj" && -n "$hex_min" ]] || return 0
     major=$(( 16#$hex_maj ))
     minor=$(( 16#$hex_min ))
     charlink="/sys/dev/char/${major}:${minor}"
     [[ -L "$charlink" ]] || return 0
-    devpath="$(readlink -f "$charlink")" || return 0
+    devpath="$(timeout 2 readlink -f "$charlink" 2>/dev/null)" || return 0
     [[ -d "$devpath" ]] || return 0
     # Layout: /sys/devices/…/<hw-device>/hidraw/hidraw0
     hwdev="$(dirname "$(dirname "$devpath")")"
