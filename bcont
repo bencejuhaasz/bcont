@@ -61,6 +61,7 @@ usage() {
     printf '  %s-d, --dbus%s         allow session D-Bus via portal filter  [default: no D-Bus]\n'  "$C_BOLD" "$C_RESET"
     printf '  %s-D, --system-dbus%s  allow system D-Bus (filtered)         [default: no]\n'       "$C_BOLD" "$C_RESET"
     printf '  %s-p, --pipewire%s     allow PipeWire audio socket            [default: no audio]\n' "$C_BOLD" "$C_RESET"
+    printf '  %s-u, --pulse%s        allow PulseAudio compat socket (needed by Wine/Proton audio)\n' "$C_BOLD" "$C_RESET"
     printf '  %s-g, --gpu%s          allow full GPU (/dev/dri)       [default: no GPU]\n'         "$C_BOLD" "$C_RESET"
     printf '      %s--gpu-render%s   allow render nodes only (no KMS/DRM)\n'                      "$C_BOLD" "$C_RESET"
     printf '  %s-F, --fido%s         allow FIDO2/U2F security keys (/dev/hidraw*) [default: no]\n' "$C_BOLD" "$C_RESET"
@@ -99,7 +100,7 @@ _profile_exists() {
 # Sets: P_NAME P_NET P_DBUS P_PIPEWIRE P_GPU P_CLI P_HOME P_RO[] P_RW[] P_CMD[]
 load_profile() {
     local target="$1" in_section=0 found=0
-    P_NET=0; P_DBUS=0; P_SYSTEM_DBUS=0; P_PIPEWIRE=0; P_GPU=0; P_CLI=0; P_FIDO=0
+    P_NET=0; P_DBUS=0; P_SYSTEM_DBUS=0; P_PIPEWIRE=0; P_PULSE=0; P_GPU=0; P_CLI=0; P_FIDO=0
     P_HOME=""; P_RO=(); P_RW=(); P_CMD=(); P_NAME="$target"
 
     [[ ! -f "$BCONT_CONFIG" ]] && die "Config not found: $BCONT_CONFIG — run: $PROG init"
@@ -139,6 +140,7 @@ load_profile() {
                 dbus)        [[ "$val" =~ ^(true|1|yes)$ ]] && P_DBUS=1 ;;
                 system_dbus) [[ "$val" =~ ^(true|1|yes)$ ]] && P_SYSTEM_DBUS=1 ;;
                 pipewire)    [[ "$val" =~ ^(true|1|yes)$ ]] && P_PIPEWIRE=1 ;;
+                pulse)       [[ "$val" =~ ^(true|1|yes)$ ]] && P_PULSE=1 ;;
                 gpu)
                     case "$val" in
                         true|full|1|yes) P_GPU=1 ;;
@@ -219,6 +221,7 @@ cmd_init() {
 #   dbus        = true | false     (session D-Bus portals proxy)
 #   system_dbus = true | false     (system D-Bus: NetworkManager, UPower, login1, bluez)
 #   pipewire  = true | false
+#   pulse     = true | false       (PulseAudio compat socket; Wine/Proton audio)
 #   gpu       = full | render | false
 #   cli       = true | false       (no Wayland socket)
 #   fido      = true | false       (FIDO2/U2F security keys via /dev/hidraw*)
@@ -273,7 +276,7 @@ _bcont_profiles() {
 _bcont() {
     local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
     local subcmds="list ls show edit init completion"
-    local opts="-n --name -N --net -d --dbus -D --system-dbus -p --pipewire -F --fido -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
+    local opts="-n --name -N --net -d --dbus -D --system-dbus -p --pipewire -u --pulse -F --fido -g --gpu --gpu-render -s --shell -H --home --ro --rw --cli --dry-run -v --verbose -h --help"
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$subcmds $(_bcont_profiles) $opts" -- "$cur") )
     elif [[ "$prev" == "show" ]]; then
@@ -320,6 +323,7 @@ _bcont() {
                 {-d,--dbus}'[Session D-Bus portals proxy]' \
                 {-D,--system-dbus}'[System D-Bus (filtered)]' \
                 {-p,--pipewire}'[PipeWire socket]' \
+                {-u,--pulse}'[PulseAudio compat socket]' \
                 {-F,--fido}'[FIDO2/U2F security keys]' \
                 {-g,--gpu}'[Full GPU access]' \
                 '--gpu-render[Render nodes only]' \
@@ -382,6 +386,7 @@ ENABLE_NET=0
 ENABLE_DBUS=0
 ENABLE_SYSTEM_DBUS=0
 ENABLE_PIPEWIRE=0
+ENABLE_PULSE=0
 ENABLE_GPU=0        # 0=none, 1=full, 2=render-only
 ENABLE_FIDO=0
 FORCE_CLI=0
@@ -401,6 +406,7 @@ if [[ -n "$PROFILE_NAME" ]]; then
     [[ $P_DBUS        -eq 1 ]] && ENABLE_DBUS=1
     [[ $P_SYSTEM_DBUS -eq 1 ]] && ENABLE_SYSTEM_DBUS=1
     [[ $P_PIPEWIRE    -eq 1 ]] && ENABLE_PIPEWIRE=1
+    [[ $P_PULSE       -eq 1 ]] && ENABLE_PULSE=1
     [[ $P_GPU      -gt 0 ]] && ENABLE_GPU=$P_GPU
     [[ $P_FIDO     -eq 1 ]] && ENABLE_FIDO=1
     [[ $P_CLI      -eq 1 ]] && FORCE_CLI=1
@@ -409,8 +415,8 @@ if [[ -n "$PROFILE_NAME" ]]; then
     EXTRA_RW+=("${P_RW[@]+"${P_RW[@]}"}")
 fi
 
-_short=n:NdDpFgsH:vh
-_long=name:,net,dbus,system-dbus,pipewire,fido,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
+_short=n:NdDpuFgsH:vh
+_long=name:,net,dbus,system-dbus,pipewire,pulse,fido,gpu,gpu-render,shell,home:,ro:,rw:,cli,dry-run,verbose,help
 
 if ! PARSED=$(getopt -o "$_short" -l "$_long" -n "$PROG" -- "$@"); then
     printf 'Run: %s --help\n' "$PROG" >&2; exit 2
@@ -424,6 +430,7 @@ while true; do
         -d|--dbus)        ENABLE_DBUS=1;                        shift   ;;
         -D|--system-dbus) ENABLE_SYSTEM_DBUS=1;                shift   ;;
         -p|--pipewire)    ENABLE_PIPEWIRE=1;                   shift   ;;
+        -u|--pulse)       ENABLE_PULSE=1;                      shift   ;;
         -F|--fido)        ENABLE_FIDO=1;                       shift   ;;
         -g|--gpu)        ENABLE_GPU=1;                          shift   ;;
            --gpu-render) ENABLE_GPU=2;                          shift   ;;
@@ -724,6 +731,22 @@ if [[ $ENABLE_PIPEWIRE -eq 1 ]]; then
     fi
 fi
 
+# ── PulseAudio (compat socket) ───────────────────────────────────────────────
+# Wine/Proton's audio driver (winepulse.drv) speaks the PulseAudio protocol,
+# not native PipeWire — it connects via the pipewire-pulse compat socket
+# under $XDG_RUNTIME_DIR/pulse. Without it bound rw, Proton's audio init can
+# fail hard during startup, killing the launch before the app/game runs.
+PULSE_ARGS=()
+if [[ $ENABLE_PULSE -eq 1 ]]; then
+    PULSE_DIR="$REAL_XRD/pulse"
+    if [[ -d "$PULSE_DIR" ]]; then
+        PULSE_ARGS=( --bind "$PULSE_DIR" "$SANDBOX_XRD_INSIDE/pulse" )
+        log_debug "PulseAudio compat socket dir: $PULSE_DIR"
+    else
+        log_warn "PulseAudio compat dir not found: $PULSE_DIR — --pulse has no effect."
+    fi
+fi
+
 # ── GPU / DRI ─────────────────────────────────────────────────────────────────
 # _bind_nvidia adds /dev/nvidia* character devices required by the NVIDIA
 # Vulkan/GL ICD (nvidiactl, nvidia0..N, nvidia-modeset, nvidia-uvm, etc.).
@@ -925,6 +948,9 @@ BWRAP_ARGS=(
     # PipeWire
     "${PIPEWIRE_ARGS[@]+"${PIPEWIRE_ARGS[@]}"}"
 
+    # PulseAudio compat socket
+    "${PULSE_ARGS[@]+"${PULSE_ARGS[@]}"}"
+
     # GPU
     "${GPU_ARGS[@]+"${GPU_ARGS[@]}"}"
 
@@ -975,7 +1001,7 @@ fi
 if [[ $VERBOSE -eq 1 ]]; then
     log_debug "Starting: $APP_NAME ($APP_ID)"
     log_debug "Command:  ${CMD[*]}"
-    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | system-dbus: $ENABLE_SYSTEM_DBUS | pipewire: $ENABLE_PIPEWIRE | gpu: $ENABLE_GPU | fido: $ENABLE_FIDO"
+    log_debug "Wayland: $WAYLAND_MODE | net: $ENABLE_NET | dbus: $ENABLE_DBUS | system-dbus: $ENABLE_SYSTEM_DBUS | pipewire: $ENABLE_PIPEWIRE | pulse: $ENABLE_PULSE | gpu: $ENABLE_GPU | fido: $ENABLE_FIDO"
 fi
 
 # ── Execute ───────────────────────────────────────────────────────────────────
