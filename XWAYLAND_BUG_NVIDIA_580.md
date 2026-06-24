@@ -137,3 +137,17 @@ Needs an upstream fix from either Xwayland (glamor buffer-teardown race)
 or the NVIDIA driver. Check for newer `xorg-xwayland` / `nvidia` package
 versions before relying on the `-glamor off` workaround long-term — once
 glamor can be re-enabled without crashing, the tearing goes away too.
+
+## Related: gamescope-nvidia, mouse clicks not registering in GamepadUI
+
+Switching from bare Xwayland to `gamescope-nvidia` (AUR, NVIDIA-patched
+fork at `sharkautarch/gamescope`, branch `nvidia-fix`) avoids the crash
+above entirely and is the preferred way to run Steam in this sandbox.
+
+One issue found: mouse clicks didn't register when Steam was launched
+in `-gamepadui` (Big Picture) mode inside gamescope-nvidia. Launching
+normal (desktop-mode) Steam inside gamescope-nvidia works fine — clicks
+work as expected. Root cause wasn't traced further (not a
+glamor/protocol issue we dug into; user confirmed by testing both
+modes). If this resurfaces, start from "is it gamepadui-mode specific"
+rather than re-diagnosing the whole input path from scratch.
